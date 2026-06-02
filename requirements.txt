@@ -1,0 +1,23 @@
+# SignBridge - Vietnamese Sign Language Recognition Pipeline
+# ============================================================
+# Python 3.13.13 (exact version currently in use)
+#
+# Install all dependencies:
+#   pip install -r requirements.txt
+#
+# NOTE: GPU is NOT supported. This project runs on CPU (local) or TPU (Google Colab).
+#
+# IMPORTANT - Additional file required manually:
+#   holistic_landmarker.task (~13 MB)
+#   This file is downloaded automatically on first run of extract_mediapipe.py.
+#   If auto-download fails, download it manually from:
+#   https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
+#   and place it in the project root directory.
+# ============================================================
+
+tensorflow==2.21.0
+numpy==2.4.6
+opencv-python==4.13.0.92
+mediapipe==0.10.35
+tqdm==4.67.3
+torch==2.12.0

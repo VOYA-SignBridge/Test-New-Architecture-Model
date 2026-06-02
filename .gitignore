@@ -1,0 +1,123 @@
+# Prerequisites
+*.d
+*.sqlite
+*.db
+*.sqlite3
+*.db3
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.env
+.venv
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---------------------------------------------------------
+# PROJECT SPECIFIC IGNORES (SignBridge)
+# ---------------------------------------------------------
+
+# Downloaded MediaPipe Models
+holistic_landmarker.task
+
+# Raw Datasets (Videos, large csv files)
+dataset/
+!dataset/.keep
+
+# Processed Data (Frames, Numpy arrays, TFRecords)
+data/
+!data/.keep
+
+# Model Outputs (Weights, Logs, Checkpoints)
+output/
+!output/.keep
+
+# Camera Demo Screenshots
+captures/
+!captures/.keep
