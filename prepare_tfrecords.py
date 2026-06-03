@@ -30,11 +30,12 @@ def main():
         print(f"Lỗi: Không tìm thấy file CSV tại {csv_path}")
         return
         
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    # Dùng utf-8-sig để tránh lỗi BOM (Byte Order Mark) nếu CSV lưu từ Excel
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Bỏ đuôi .mp4 để so sánh cho dễ (VD: D0001N.mp4 -> D0001N)
-            video_name = row['VIDEO'].replace('.mp4', '')
+            # Tự động lấy tên file bỏ đuôi mở rộng (tránh phân biệt .mp4 hay .MP4)
+            video_name = Path(row['VIDEO']).stem
             video_to_label[video_name] = row['LABEL']
             
     # 2. Quét các file .pt đã trích xuất MediaPipe
@@ -73,8 +74,9 @@ def main():
     dataset = [(pt_file, label_to_id[label_str]) for pt_file, label_str in valid_videos]
     
     # 4. Trộn ngẫu nhiên và chia thành 5 folds (để Cross Validation)
-    np.random.seed(42)
-    np.random.shuffle(dataset)
+    import random
+    random.seed(42)
+    random.shuffle(dataset)
     
     n_splits = 5
     # Cắt mảng thành n phần đều nhau
@@ -92,11 +94,12 @@ def main():
         with tf.io.TFRecordWriter(tfrec_name) as writer:
             for pt_file, label_id in tqdm(fold_data, desc=f"Writing fold {fold_idx}"):
                 # Đọc ma trận Tensor từ file .pt
-                # Lưu ý: weight_onlys=True để tránh cảnh báo an toàn từ PyTorch bản mới
+                # Lưu ý: weights_only=False để tránh cảnh báo an toàn từ PyTorch bản mới
                 tensor = torch.load(pt_file, weights_only=False)
                 
-                # Chuyển về float32 để khớp tuyệt đối với `decode_tfrec`
+                # Chuyển về float32 và đảm bảo bộ nhớ liền kề (contiguous) để tobytes() không bị lỗi
                 np_array = tensor.numpy().astype(np.float32)
+                np_array = np.ascontiguousarray(np_array)
                 
                 # Chuyển thành Features
                 feature = {

@@ -21,8 +21,9 @@ Real-time Vietnamese sign language recognition using a **Transformer + Causal DW
 ├── extract_frames.py       # Step 1: Extract frames from videos
 ├── extract_mediapipe.py    # Step 2: Extract 543 body landmarks via MediaPipe
 ├── prepare_tfrecords.py    # Step 3: Pack .npy matrices into TFRecord files
-├── train.py                # Step 4: Train the model (5-Fold Cross-Validation)
-├── camera_demo.py          # Step 5: Real-time webcam inference
+├── train.py                # Step 4: Train the model & Auto-export to .tflite
+├── camera_demo.py          # Step 5: Real-time inference (Standard Keras)
+├── camera_demo_tflite.py   # Step 5: Real-time inference (TFLite Engine)
 │
 ├── holistic_landmarker.task   ⚠️ Required — see note below
 ├── requirements.txt
@@ -103,6 +104,7 @@ Trains a Transformer model using 5-Fold Cross-Validation.
 Results are saved to `output/[timestamp]/`:
 - `*.weights.h5` — best model weights per fold
 - `*-logs.csv` — loss/accuracy log per epoch
+- `*-best-float16.tflite` — compressed, deployment-ready TFLite model (auto-generated)
 
 Key settings inside `train.py` (class `CFG`):
 
@@ -117,22 +119,17 @@ Key settings inside `train.py` (class `CFG`):
 
 ### Step 5 — Run webcam demo
 
+There are two versions of the webcam demo available. **We highly recommend using the TFLite version** for significantly better performance and lower resource usage.
+
 ```bash
+# Option A: Fast inference using the compressed TFLite Engine (Recommended)
+python camera_demo_tflite.py
+
+# Option B: Standard Keras inference (Builds architecture dynamically)
 python camera_demo.py
 ```
 
-On startup, a menu appears asking which trained model to use:
-
-```
-==================================================
- AVAILABLE TRAINED MODELS
-==================================================
-  [1] 2-42-3-6-2026
-  [2] 14-30-3-6-2026
---------------------------------------------------
-Enter folder name or number:
->> 1
-```
+On startup, an interactive menu will appear asking you to select the trained model directory.
 
 **Controls during demo:**
 
@@ -150,9 +147,9 @@ Enter folder name or number:
 
 **Optional flags:**
 ```bash
-python camera_demo.py --camera 1        # Use a different camera index
-python camera_demo.py --topk 5          # Show top 5 predictions
-python camera_demo.py --model path/to/model.weights.h5   # Load specific model file
+python camera_demo_tflite.py --camera 1        # Use a different camera index
+python camera_demo_tflite.py --topk 5          # Show top 5 predictions
+python camera_demo_tflite.py --model path/to/model.tflite   # Load specific model file
 ```
 
 ---

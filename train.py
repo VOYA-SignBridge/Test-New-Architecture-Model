@@ -706,10 +706,23 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
     )
 
     if CFG.save_output:
+        best_weights = f"{CFG.output_dir}/{CFG.comment}-fold{fold}-best.weights.h5"
+        
+        # 1. Nạp lại trọng số tốt nhất của fold này
         try:
-            model.load_weights(f"{CFG.output_dir}/{CFG.comment}-fold{fold}-best.weights.h5")
-        except:
-            pass
+            model.load_weights(best_weights)
+        except Exception as e:
+            print(f"[WARN] Không thể load best weights: {e}")
+
+        # 2. Xuất TFLite — buộc phải reset về float32 trước khi convert
+        #    (TFLite converter không hỗ trợ mixed_bfloat16 / mixed_float16)
+        try:
+            mixed_precision.set_global_policy("float32")
+            tflite_path = f"{CFG.output_dir}/{CFG.comment}-fold{fold}-best-float16.tflite"
+            export_tflite(model, tflite_path, quantize="float16")
+            verify_tflite(tflite_path)
+        except Exception as e:
+            print(f"[WARN] Xuất TFLite thất bại (không ảnh hưởng kết quả train): {e}")
 
     if fold != "all":
         cv = model.evaluate(valid_ds, verbose=CFG.verbose,
@@ -718,6 +731,42 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
         cv = None
 
     return model, cv, history
+
+
+# ─── TFLITE EXPORT HELPERS ───────────────────────────────────────────────────
+def export_tflite(model: tf.keras.Model, output_path: str, quantize: str = "float16"):
+    print(f"\n[INFO] Đang nén mô hình sang TFLite (quantize={quantize})...")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+
+    if quantize == "float16":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float16]
+    elif quantize == "int8":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    tflite_model = converter.convert()
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+    
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"[OK]   Đã xuất TFLite thành công: {output_path} ({size_mb:.2f} MB)")
+
+def verify_tflite(tflite_path: str):
+    print("[INFO] Đang kiểm tra file .tflite với dummy input...")
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    input_details  = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # Dùng MAX_LEN (module-level constant) vì CFG.max_len = MAX_LEN
+    dummy_input = np.zeros((1, MAX_LEN, CHANNELS), dtype=input_details[0]["dtype"])
+    interpreter.set_tensor(input_details[0]["index"], dummy_input)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details[0]["index"])
+    
+    probs = tf.nn.softmax(output[0].astype(np.float32)).numpy()
+    print(f"[OK]   Dummy Softmax: {probs.tolist()}")
+    print("[OK]   TFLite sẵn sàng → chạy: python camera_demo_tflite.py\n")
 
 
 def train_folds(CFG, folds, strategy=STRATEGY, summary=True):
