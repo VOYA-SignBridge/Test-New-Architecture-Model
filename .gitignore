@@ -110,13 +110,15 @@ holistic_landmarker.task
 dataset/
 !dataset/.keep
 
-# Processed Data (Frames, Numpy arrays, TFRecords)
-data/
-!data/.keep
+# Processed Data (Đã mở khóa TFRecord để push lên GitHub, bỏ qua file npy/npz nặng)
+data/*
+!data/Vietnamese/
+data/Vietnamese/*
+!data/Vietnamese/TFRecord/
 
-# Model Outputs (Weights, Logs, Checkpoints)
-output/
-!output/.keep
+# Model Outputs (Đã mở khóa để push weights, tflite, logs lên GitHub)
+# output/
+# !output/.keep
 
 # Camera Demo Screenshots
 captures/
