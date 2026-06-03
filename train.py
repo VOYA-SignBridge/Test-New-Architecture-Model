@@ -9,6 +9,7 @@ import gc
 import glob
 import random
 import datetime
+import re
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras.mixed_precision as mixed_precision
@@ -34,7 +35,56 @@ except ImportError:
 # Output: thư mục lưu model weights + logs
 DATA_DIR   = "./data/Vietnamese/TFRecord"
 OUTPUT_DIR = "./outputs"
+
+# ============================================================================
+# CẤU HÌNH: Số lượng video và bộ lọc
+# ============================================================================
+MAX_VIDEOS = 5          # None = tất cả video; số nguyên = số video muốn huấn luyện
+FILTER_SUFFIX = None       # Lọc video có chữ này ở cuối tên (ví dụ: "N" -> D0001N)
+                           # Đặt = None để bỏ qua bộ lọc
+
 TRAIN_FILENAMES = glob.glob(os.path.join(DATA_DIR, "**/*.tfrecords"), recursive=True)
+
+# Áp dụng bộ lọc suffix nếu được chỉ định
+if FILTER_SUFFIX is not None:
+    original_count = len(TRAIN_FILENAMES)
+    TRAIN_FILENAMES = [f for f in TRAIN_FILENAMES if FILTER_SUFFIX in f]
+    print(f"ℹ️  Bộ lọc: Chỉ xử lý video có chữ '{FILTER_SUFFIX}' trong tên")
+    print(f"   Từ {original_count} file → {len(TRAIN_FILENAMES)} file")
+
+# Giới hạn số lượng video nếu được đặt
+if MAX_VIDEOS is not None:
+    # Trích xuất danh sách video duy nhất từ tên file (fold_X-COUNT.tfrecords)
+    video_counts = {}
+    for fname in TRAIN_FILENAMES:
+        # Tìm số lượng video trong file từ tên: fold_0-110 → 110
+        match = re.search(r'-(\d+)\.tfrecords', fname)
+        if match:
+            count = int(match.group(1))
+            fold = re.search(r'fold_(\d+)', fname)
+            fold_idx = int(fold.group(1)) if fold else 0
+            if fold_idx not in video_counts:
+                video_counts[fold_idx] = 0
+            video_counts[fold_idx] += count
+    
+    # Tính tổng số video hiện tại
+    total_videos = sum(video_counts.values())
+    
+    if total_videos > MAX_VIDEOS:
+        # Lọc để chỉ giữ MAX_VIDEOS video đầu tiên
+        videos_kept = 0
+        filtered_files = []
+        for fname in sorted(TRAIN_FILENAMES):
+            match = re.search(r'-(\d+)\.tfrecords', fname)
+            if match:
+                count = int(match.group(1))
+                if videos_kept + count <= MAX_VIDEOS:
+                    filtered_files.append(fname)
+                    videos_kept += count
+        
+        TRAIN_FILENAMES = filtered_files
+        print(f"ℹ️  Giới hạn: Chỉ xử lý {MAX_VIDEOS} video đầu tiên")
+        print(f"   Từ {total_videos} video → {videos_kept} video")
 
 # ─── HYPERPARAMETERS ──────────────────────────────────────────────────────────
 ROWS_PER_FRAME = 543
@@ -84,8 +134,6 @@ def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
-
-import re
 
 def count_data_items(filenames):
     n = [int(re.compile(r"-([0-9]*)\.").search(filename.split('/')[-1]).group(1)) for filename in filenames]
@@ -491,10 +539,11 @@ def get_model(max_len=64, dropout_step=0, dim=192):
 class CFG:
     n_splits = 5
     save_output = True
-    
+
     _now = datetime.datetime.now()
     output_dir = f"output/{_now.hour}-{_now.minute}-{_now.day}-{_now.month}-{_now.year}"
-    os.makedirs(output_dir, exist_ok=True)
+    # ⚠️ os.makedirs được gọi trong train_fold() thay vì ở đây
+    # để tránh tạo thư mục mỗi lần import train.py (vd: từ camera_demo.py)
     
     seed = 42
     verbose = 2
@@ -504,7 +553,7 @@ class CFG:
     lr = 5e-4 * replicas
     weight_decay = 0.1
     lr_min = 1e-6
-    epoch = 300
+    epoch = 50
     warmup = 0
     batch_size = 64 * replicas
     snapshot_epochs = []
@@ -559,6 +608,7 @@ except:
 # ─── TRAINING LOOP ────────────────────────────────────────────────────────────
 def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summary=True):
     seed_everything(CFG.seed)
+    os.makedirs(CFG.output_dir, exist_ok=True)   # Tạo thư mục output khi bắt đầu train
     tf.keras.backend.clear_session()
     gc.collect()
     tf.config.optimizer.set_jit(True)
@@ -714,16 +764,6 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
         except Exception as e:
             print(f"[WARN] Không thể load best weights: {e}")
 
-        # 2. Xuất TFLite — buộc phải reset về float32 trước khi convert
-        #    (TFLite converter không hỗ trợ mixed_bfloat16 / mixed_float16)
-        try:
-            mixed_precision.set_global_policy("float32")
-            tflite_path = f"{CFG.output_dir}/{CFG.comment}-fold{fold}-best-float16.tflite"
-            export_tflite(model, tflite_path, quantize="float16")
-            verify_tflite(tflite_path)
-        except Exception as e:
-            print(f"[WARN] Xuất TFLite thất bại (không ảnh hưởng kết quả train): {e}")
-
     if fold != "all":
         cv = model.evaluate(valid_ds, verbose=CFG.verbose,
                             steps=-(num_valid // -CFG.batch_size))
@@ -731,42 +771,6 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
         cv = None
 
     return model, cv, history
-
-
-# ─── TFLITE EXPORT HELPERS ───────────────────────────────────────────────────
-def export_tflite(model: tf.keras.Model, output_path: str, quantize: str = "float16"):
-    print(f"\n[INFO] Đang nén mô hình sang TFLite (quantize={quantize})...")
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-
-    if quantize == "float16":
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_types = [tf.float16]
-    elif quantize == "int8":
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-    tflite_model = converter.convert()
-    with open(output_path, "wb") as f:
-        f.write(tflite_model)
-    
-    size_mb = os.path.getsize(output_path) / 1024 / 1024
-    print(f"[OK]   Đã xuất TFLite thành công: {output_path} ({size_mb:.2f} MB)")
-
-def verify_tflite(tflite_path: str):
-    print("[INFO] Đang kiểm tra file .tflite với dummy input...")
-    interpreter = tf.lite.Interpreter(model_path=tflite_path)
-    interpreter.allocate_tensors()
-    input_details  = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    # Dùng MAX_LEN (module-level constant) vì CFG.max_len = MAX_LEN
-    dummy_input = np.zeros((1, MAX_LEN, CHANNELS), dtype=input_details[0]["dtype"])
-    interpreter.set_tensor(input_details[0]["index"], dummy_input)
-    interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]["index"])
-    
-    probs = tf.nn.softmax(output[0].astype(np.float32)).numpy()
-    print(f"[OK]   Dummy Softmax: {probs.tolist()}")
-    print("[OK]   TFLite sẵn sàng → chạy: python camera_demo_tflite.py\n")
 
 
 def train_folds(CFG, folds, strategy=STRATEGY, summary=True):

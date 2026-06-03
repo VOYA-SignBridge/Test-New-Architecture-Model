@@ -2,7 +2,6 @@ import os
 import glob
 import csv
 import json
-import torch
 import numpy as np
 import tensorflow as tf
 from pathlib import Path
@@ -38,23 +37,23 @@ def main():
             video_name = Path(row['VIDEO']).stem
             video_to_label[video_name] = row['LABEL']
             
-    # 2. Quét các file .pt đã trích xuất MediaPipe
-    pt_files = glob.glob(os.path.join(pt_dir, "*.pt"))
-    if not pt_files:
-        print(f"Không tìm thấy file .pt nào trong {pt_dir}")
+    # 2. Quét các file .npy đã trích xuất MediaPipe
+    npy_files = glob.glob(os.path.join(pt_dir, "*.npy"))
+    if not npy_files:
+        print(f"Không tìm thấy file .npy nào trong {pt_dir}")
         return
         
-    print(f"Tìm thấy {len(pt_files)} file .pt để ghép.")
+    print(f"Tìm thấy {len(npy_files)} file .npy để ghép.")
     
     # 3. Lọc danh sách và cấp mã ID cho các Label có tồn tại
     valid_videos = []
     present_labels = set()
     
-    for pt_file in pt_files:
-        video_name = Path(pt_file).stem.replace("_mediapipe", "")
+    for npy_file in npy_files:
+        video_name = Path(npy_file).stem.replace("_mediapipe", "")
         if video_name in video_to_label:
             label_str = video_to_label[video_name]
-            valid_videos.append((pt_file, label_str))
+            valid_videos.append((npy_file, label_str))
             present_labels.add(label_str)
         else:
             print(f"[Cảnh báo] Video {video_name} không có trong file label CSV. Đã bỏ qua!")
@@ -92,13 +91,9 @@ def main():
         tfrec_name = os.path.join(out_dir, f"fold_{fold_idx}-{count}.tfrecords")
         
         with tf.io.TFRecordWriter(tfrec_name) as writer:
-            for pt_file, label_id in tqdm(fold_data, desc=f"Writing fold {fold_idx}"):
-                # Đọc ma trận Tensor từ file .pt
-                # Lưu ý: weights_only=False để tránh cảnh báo an toàn từ PyTorch bản mới
-                tensor = torch.load(pt_file, weights_only=False)
-                
-                # Chuyển về float32 và đảm bảo bộ nhớ liền kề (contiguous) để tobytes() không bị lỗi
-                np_array = tensor.numpy().astype(np.float32)
+            for npy_file, label_id in tqdm(fold_data, desc=f"Writing fold {fold_idx}"):
+                # Đọc ma trận numpy từ file .npy
+                np_array = np.load(npy_file).astype(np.float32)
                 np_array = np.ascontiguousarray(np_array)
                 
                 # Chuyển thành Features

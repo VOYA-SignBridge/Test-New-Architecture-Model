@@ -90,7 +90,7 @@ def init_mediapipe():
     mp_holistic = mp.solutions.holistic
     holistic = mp_holistic.Holistic(
         min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.7,
         model_complexity=1
     )
     mp_drawing = mp.solutions.drawing_utils
@@ -211,7 +211,9 @@ def load_tflite_model(model_path: str = ""):
             print("  → Hãy chạy export_tflite.py trước!")
             sys.exit(1)
             
-        model_path = candidates[0]
+        # Ưu tiên file 'best' hơn các file khác
+        best_files = [c for c in candidates if "best" in os.path.basename(c)]
+        model_path = best_files[0] if best_files else candidates[0]
         print(f"\n[INFO] Đã chọn model: {model_path}")
 
     if not os.path.exists(model_path):
@@ -324,118 +326,35 @@ class SignPredictorTFLite:
 def draw_overlay(frame: np.ndarray, predictor: SignPredictorTFLite,
                  buffer_size: int, topk: int):
     h, w, _ = frame.shape
-    panel_w = 300
     
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (panel_w, h), (15, 15, 15), -1)
-    alpha = 0.85
-    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-    cv2.putText(frame, "SignBridge TFLite", (10, 35),
-                cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 1)
-    cv2.line(frame, (10, 50), (panel_w - 10, 50), (80, 80, 80), 1)
-
-    y = 80
-    cv2.putText(frame, "STATUS:", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-    y += 25
-
-    if predictor.hand_detected:
-        cv2.putText(frame, "DETECTING", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 1)
-    else:
-        cv2.putText(frame, "WAITING...", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 140, 255), 1)
-    y += 35
-
-    bar_w = panel_w - 20
-    fill_w = int((buffer_size / BUFFER_LEN) * bar_w)
-    cv2.rectangle(frame, (10, y), (10 + bar_w, y + 10), (50, 50, 50), -1)
-    cv2.rectangle(frame, (10, y), (10 + fill_w, y + 10), (0, 255, 0), -1)
-    y += 40
-
-    cv2.putText(frame, "PREDICTION:", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-    y += 35
-
     if predictor.last_label:
         conf_pct = predictor.last_confidence * 100
-        if conf_pct > 70: label_color = (0, 255, 0)
-        elif conf_pct > 50: label_color = (0, 200, 255)
-        else: label_color = (0, 140, 255)
-
-        label_display = predictor.last_original[:15]
-        cv2.putText(frame, label_display, (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.1, label_color, 2)
-        y += 45
-        cv2.putText(frame, f"({predictor.last_label})  {conf_pct:.1f}%",
-                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color, 1)
-    else:
-        cv2.putText(frame, "---", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.0, (100, 100, 100), 2)
-
-    y += 35
-    cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
-    y += 15
-
-    if predictor.last_topk:
-        cv2.putText(frame, f"TOP {topk}:", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
-        y += 22
-
-        for rank, (slug, orig, conf) in enumerate(predictor.last_topk[:topk]):
-            bar_fill  = int((panel_w - 20) * conf)
-            bar_color = (0, 140, 255) if rank == 0 else (60, 100, 160)
-
-            cv2.rectangle(frame, (10, y), (10 + bar_fill, y + 18), bar_color, -1)
-            cv2.rectangle(frame, (10, y), (panel_w - 10, y + 18), (80, 80, 80), 1)
-
-            label_txt = f"{rank+1}. {orig}  {conf*100:.0f}%"
-            cv2.putText(frame, label_txt, (14, y + 13),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            y += 25
-
-    guides = ["[R] Reset buffer", "[Q] Thoat", "[S] Chup man hinh"]
-    for i, g in enumerate(guides):
-        cv2.putText(frame, g, (10, h - 60 + i * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1)
-
-    # ─── CHỮ DỰ ĐOÁN SIÊU TO Ở GÓC DƯỚI BÊN PHẢI ───────────────────────────────
-    if predictor.last_label and predictor.last_confidence > 0.3:
-        conf_pct = predictor.last_confidence * 100
-        text = predictor.last_original
-        conf_text = f"{conf_pct:.0f}%"
-        font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 1.8
-        thickness = 3
-        (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
-        (conf_w, conf_h), _ = cv2.getTextSize(conf_text, font, 0.9, 2)
         
-        margin_x = 30
-        margin_y = 30
-        x_pos = w - text_w - margin_x
-        y_pos = h - margin_y - conf_h - 10
-
-        bg_x1 = max(0, x_pos - 15)
-        bg_y1 = max(0, y_pos - text_h - 15)
-        bg_x2 = w
-        bg_y2 = h
-        bg_overlay = frame.copy()
-        cv2.rectangle(bg_overlay, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
-        frame = cv2.addWeighted(bg_overlay, 0.6, frame, 0.4, 0)
-
+        text = f"{predictor.last_label} : {conf_pct:.0f}%"
+        
         if conf_pct > 70:
-            label_color = (0, 255, 0)
-        elif conf_pct > 50:
-            label_color = (0, 200, 255)
+            color = (0, 255, 0) # Xanh lá
+        elif conf_pct > 40:
+            color = (0, 200, 255) # Vàng/Cam
         else:
-            label_color = (0, 140, 255)
-
-        cv2.putText(frame, text, (x_pos, y_pos), font, font_scale, (0, 0, 0), thickness + 2)
-        cv2.putText(frame, text, (x_pos, y_pos), font, font_scale, label_color, thickness)
-        cv2.putText(frame, conf_text, (w - conf_w - margin_x, h - margin_y),
-                    font, 0.9, label_color, 2)
-
+            color = (0, 0, 255) # Đỏ
+            
+        font = cv2.FONT_HERSHEY_DUPLEX
+        font_scale = 1.5
+        thickness = 2
+        
+        (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        x = max(50, (w - text_width) // 2)
+        y = h - 50
+        
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x - 15, y - text_height - 15), (x + text_width + 15, y + 15), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        
+        cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 0), thickness + 2)
+        cv2.putText(frame, text, (x, y), font, font_scale, color, thickness)
+        
     return frame
 
 
@@ -457,8 +376,11 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
         print(f"[ERROR] Không mở được camera {camera_idx}")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+    
+    cv2.namedWindow("SignBridge AI (TFLite Engine)", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("SignBridge AI (TFLite Engine)", 800, 600)
 
     print("\n[INFO] Camera đang chạy (Phiên bản TFLite siêu nén).")
     os.makedirs("captures", exist_ok=True)
@@ -485,12 +407,8 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
             vec = extract_holistic(results)
             predictor.push_frame(vec)
 
-            if results.face_landmarks:
-                mp_drawing.draw_landmarks(frame, results.face_landmarks, mp_holistic.FACEMESH_TESSELATION, 
-                    mp_drawing_styles.get_default_face_mesh_tesselation_style())
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS,
-                    mp_drawing_styles.get_default_pose_landmarks_style())
+            # Chỉ vẽ tay
+
             if results.left_hand_landmarks:
                 mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
                     mp_drawing_styles.get_default_hand_landmarks_style())
@@ -505,6 +423,10 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             cv2.imshow("SignBridge AI (TFLite Engine)", frame)
+
+            # Hỗ trợ bấm nút X trên cửa sổ để tắt
+            if cv2.getWindowProperty("SignBridge AI (TFLite Engine)", cv2.WND_PROP_VISIBLE) < 1:
+                break
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:

@@ -1,7 +1,6 @@
 import os
 import glob
 import cv2
-import torch
 import urllib.request
 import numpy as np
 import mediapipe as mp
@@ -9,6 +8,13 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from pathlib import Path
 from tqdm import tqdm
+
+# ============================================================================
+# CẤU HÌNH: Số lượng video và bộ lọc
+# ============================================================================
+MAX_VIDEOS = 5          # None = tất cả video; số nguyên = số video muốn xử lý
+FILTER_SUFFIX = "N"       # Lọc video có chữ này ở cuối tên (ví dụ: "N" -> D0001N)
+                           # Đặt = None để bỏ qua bộ lọc
 
 MODEL_PATH = "holistic_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
@@ -112,15 +118,27 @@ def main():
     if not video_files:
         print(f"Không tìm thấy file .mp4 nào trong {dataset_dir}")
         return
+    
+    # Lọc video theo suffix nếu được chỉ định
+    if FILTER_SUFFIX is not None:
+        original_count = len(video_files)
+        video_files = [v for v in video_files if Path(v).stem.endswith(FILTER_SUFFIX)]
+        print(f"ℹ️  Bộ lọc: Chỉ xử lý video có chữ '{FILTER_SUFFIX}' ở cuối tên")
+        print(f"   Từ {original_count} video → {len(video_files)} video")
+    
+    # Giới hạn số lượng video nếu được đặt
+    if MAX_VIDEOS is not None and len(video_files) > MAX_VIDEOS:
+        video_files = video_files[:MAX_VIDEOS]
+        print(f"ℹ️  Giới hạn: Chỉ xử lý {MAX_VIDEOS} video đầu tiên")
         
-    print(f"Bắt đầu trích xuất MediaPipe cho {len(video_files)} video...")
+    print(f"\n🎬 Bắt đầu trích xuất MediaPipe cho {len(video_files)} video...")
     
     # Tạo options 1 lần, nhưng landmarker sẽ được tạo mới cho từng video
     options = create_landmarker_options()
     
     for video_path in tqdm(video_files, desc="Đang trích xuất MediaPipe"):
         video_name = Path(video_path).stem
-        output_path = os.path.join(output_dir, f"{video_name}_mediapipe.pt")
+        output_path = os.path.join(output_dir, f"{video_name}_mediapipe.npy")
         
         # Bỏ qua nếu đã trích xuất trước đó (Resume)
         if os.path.exists(output_path):
@@ -129,8 +147,7 @@ def main():
         landmarks_data = extract_landmarks(video_path, options)
         
         if landmarks_data is not None:
-            tensor_data = torch.from_numpy(landmarks_data)
-            torch.save(tensor_data, output_path)
+            np.save(output_path, landmarks_data)
 
 if __name__ == "__main__":
     main()

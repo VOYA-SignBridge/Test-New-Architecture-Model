@@ -32,9 +32,13 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
 except ImportError:
     print("[ERROR] Thiếu mediapipe. Chạy: pip install mediapipe")
     sys.exit(1)
+
+import urllib.request
 
 try:
     import tensorflow as tf
@@ -71,6 +75,16 @@ CHANNELS        = 6 * NUM_NODES   # 708
 DEFAULT_MODEL_DIR   = "./output"
 DEFAULT_DATASET_DIR = "./dataset/Vietnamese"
 
+MP_MODEL_PATH = "holistic_landmarker.task"
+MP_MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
+
+def _ensure_mp_model():
+    """Tải model MediaPipe nếu chưa có."""
+    if not os.path.exists(MP_MODEL_PATH):
+        print(f"[INFO] Đang tải model MediaPipe ({MP_MODEL_PATH})...")
+        urllib.request.urlretrieve(MP_MODEL_URL, MP_MODEL_PATH)
+        print("[INFO] Tải xong!")
+
 
 # ─── LOAD LABEL MAP ───────────────────────────────────────────────────────────
 def load_label_map(dataset_dir: str = DEFAULT_DATASET_DIR):
@@ -100,50 +114,89 @@ def load_label_map(dataset_dir: str = DEFAULT_DATASET_DIR):
     return label_map, label_original
 
 
-# ─── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
+# ─── MEDIAPIPE SETUP (Tasks API 0.10+) ────────────────────────────────────────
 def init_mediapipe():
-    """Khởi tạo MediaPipe Holistic."""
-    mp_holistic = mp.solutions.holistic
-    holistic = mp_holistic.Holistic(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-        model_complexity=1
+    """Khởi tạo HolisticLandmarker dùng MediaPipe Tasks API mới (>=0.10)."""
+    _ensure_mp_model()
+    base_options = mp_python.BaseOptions(model_asset_path=MP_MODEL_PATH)
+    options = mp_vision.HolisticLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        min_face_detection_confidence=0.5,
+        min_face_landmarks_confidence=0.5,
+        min_pose_detection_confidence=0.5,
+        min_pose_landmarks_confidence=0.5,
+        min_hand_landmarks_confidence=0.5,  # 0.5 giúp detect tốt hơn khi tay co lại
+        output_face_blendshapes=False,
     )
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    return holistic, mp_holistic, mp_drawing, mp_drawing_styles
+    return mp_vision.HolisticLandmarker.create_from_options(options)
 
 
 def extract_holistic(results) -> np.ndarray:
     """
-    Trích xuất vector (543, 3) từ kết quả MediaPipe Holistic.
+    Trích xuất vector (543, 3) từ kết quả Tasks API.
     Cấu trúc y hệt mảng 543 điểm chuẩn:
-      0-467: Face
-      468-488: Left Hand
-      489-521: Pose
-      522-542: Right Hand
-    Nếu không detect được → NaN.
+      0-467: Face  |  468-488: Left Hand  |  489-521: Pose  |  522-542: Right Hand
+    Tasks API trả về list NormalizedLandmark trực tiếp (không có .landmark).
     """
     frame_data = np.full((543, 3), np.nan, dtype=np.float32)
-    
+
     if results.face_landmarks:
-        for i, lm in enumerate(results.face_landmarks.landmark):
-            if i < 468: 
+        for i, lm in enumerate(results.face_landmarks):
+            if i < 468:
                 frame_data[i] = [lm.x, lm.y, lm.z]
-                
+
     if results.left_hand_landmarks:
-        for i, lm in enumerate(results.left_hand_landmarks.landmark):
+        for i, lm in enumerate(results.left_hand_landmarks):
             frame_data[468 + i] = [lm.x, lm.y, lm.z]
-            
+
     if results.pose_landmarks:
-        for i, lm in enumerate(results.pose_landmarks.landmark):
+        for i, lm in enumerate(results.pose_landmarks):
             frame_data[489 + i] = [lm.x, lm.y, lm.z]
-            
+
     if results.right_hand_landmarks:
-        for i, lm in enumerate(results.right_hand_landmarks.landmark):
+        for i, lm in enumerate(results.right_hand_landmarks):
             frame_data[522 + i] = [lm.x, lm.y, lm.z]
 
     return frame_data
+
+
+def draw_landmarks_cv2(frame: np.ndarray, results) -> np.ndarray:
+    """
+    Vẽ landmarks bằng OpenCV thuần (Tasks API không có mp_drawing).
+    """
+    h, w, _ = frame.shape
+    
+    HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (5, 6), (6, 7), (7, 8),
+        (9, 10), (10, 11), (11, 12),
+        (13, 14), (14, 15), (15, 16),
+        (17, 18), (18, 19), (19, 20),
+        (0, 5), (5, 9), (9, 13), (13, 17), (0, 17)
+    ]
+
+    def _draw_hand(landmarks, dot_color, line_color, radius=4, thickness=2):
+        if not landmarks: return
+        
+        pts = []
+        for lm in landmarks:
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            pts.append((cx, cy))
+            
+        # Vẽ các đoạn thẳng (xương)
+        for p1, p2 in HAND_CONNECTIONS:
+            if p1 < len(pts) and p2 < len(pts):
+                cv2.line(frame, pts[p1], pts[p2], line_color, thickness)
+                
+        # Vẽ các chấm (khớp)
+        for p in pts:
+            cv2.circle(frame, p, radius, dot_color, -1)
+
+    _draw_hand(results.left_hand_landmarks,  (0, 255, 0), (144, 238, 144))  # tay trái — xanh lá
+    _draw_hand(results.right_hand_landmarks, (0, 0, 255), (128, 128, 255))  # tay phải — đỏ
+    
+    return frame
 
 
 # ─── PREPROCESS (phải khớp 100% với train.py) ────────────────────────────────
@@ -248,8 +301,10 @@ def load_model(model_path: str = ""):
         if not candidates:
             print(f"[ERROR] Không tìm thấy file .weights.h5 nào bên trong {selected_folder}/")
             sys.exit(1)
-            
-        model_path = candidates[0]
+
+        # Ưu tiên file 'best' hơn file 'last'
+        best_files = [c for c in candidates if "best" in os.path.basename(c)]
+        model_path = best_files[0] if best_files else candidates[0]
         print(f"\n[INFO] Đã chọn model: {model_path}")
 
     if not os.path.exists(model_path):
@@ -260,8 +315,15 @@ def load_model(model_path: str = ""):
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from train import get_model
 
-    # Tạo model khớp với lúc train (dim=192, MAX_LEN=384)
-    model = get_model(max_len=MAX_LEN, dropout_step=0, dim=192)
+    # Tự động nhận diện dim từ tên file (vd: islr-fp16-192-... hoặc islr-fp16-384-...)
+    dim = 192  # giá trị mặc định
+    for candidate_dim in [384, 256, 192]:
+        if f"-{candidate_dim}-" in os.path.basename(model_path):
+            dim = candidate_dim
+            break
+    print(f"[INFO] Tự động nhận diện kiến trúc: dim={dim}")
+
+    model = get_model(max_len=MAX_LEN, dropout_step=0, dim=dim)
     model.load_weights(model_path)
     print(f"[INFO] Model ready. Input={model.input_shape}, Output={model.output_shape}")
     return model
@@ -276,64 +338,82 @@ class SignPredictor:
     """
 
     def __init__(self, model, label_map: dict, label_original: dict,
-                 topk: int = 3, slide: int = 15):
+                 topk: int = 3, slide: int = 30):
         self.model          = model
         self.label_map      = label_map
         self.label_original = label_original
         self.topk           = topk
-        self.slide          = slide     # số frame xóa sau mỗi predict (slide = 15 để predict nhanh)
+        self.slide          = slide  # slide = 30: predict mỗi 30 frame, đủ để tín hiệu ổn định
 
         self.preprocess = Preprocess(max_len=MAX_LEN)
-        self.buffer     = []            # list of ndarray (543, 3)
+        self.buffer     = []  # list of ndarray (543, 3)
 
-        self.last_label      = ""
-        self.last_original   = ""
-        self.last_confidence = 0.0
-        self.last_topk       = []
-        self.is_detecting    = False
-        self.hand_detected   = False
+        self.last_label         = ""
+        self.last_original      = ""
+        self.last_confidence    = 0.0
+        self.last_topk          = []
+        self.is_detecting       = False
+        self.hand_detected      = False
+        self._grace_count       = 0   # đếm số frame liên tiếp không có tay
+        self._recent_labels     = []  # lưu 3 kết quả gần nhất để smoothing
+        self._last_known_vec    = None  # vị trí tay lần cuối detect được
+
+    GRACE_MAX   = 8   # số frame tay tạm khuất vẫn giữ buffer (tăng từ 5 lên 8)
+    CLEAR_AFTER = 20  # số frame sau khi tay biến hẳn mới xóa buffer
 
     def push_frame(self, vec_543: np.ndarray) -> bool:
-        # Check xem có tay trong khung hình không
         lhand = vec_543[468:489]
         rhand = vec_543[522:543]
         has_hand = not (np.isnan(lhand).all() and np.isnan(rhand).all())
-        
+
         self.hand_detected = has_hand
 
         if has_hand:
-            self.is_detecting = True
+            self.is_detecting    = True
+            self._grace_count    = 0
+            self._last_known_vec = vec_543.copy()  # lưu vị trí mới nhất
             self.buffer.append(vec_543)
+        elif self._grace_count < self.GRACE_MAX and self._last_known_vec is not None:
+            # ── "LAST KNOWN POSITION" TRACKING ──────────────────────────
+            # Tay tạm khuất (nằm ngang, co lại, bị che khuất...) nhưng
+            # ta vẫn biết tay đang ở đâu (lần cuối detect được).
+            # Điền vị trí cũ vào buffer thay vì NaN để:
+            #   1) buffer không bị đứt → signal liên tục
+            #   2) model không nhận toàn NaN → predict ít nhiễu hơn
+            self._grace_count += 1
+            self.buffer.append(self._last_known_vec)
+        else:
+            # Tay mất hẳn quá lâu
+            self._grace_count += 1
+            if self._grace_count >= self.CLEAR_AFTER:
+                self.buffer          = []
+                self.is_detecting    = False
+                self._last_known_vec = None
 
-        # Đủ BUFFER_LEN (vd 60 frame) → predict
         if len(self.buffer) >= BUFFER_LEN:
             self._predict()
-            # Sliding: xóa slide frame đầu
             self.buffer = self.buffer[self.slide:]
             return True
 
         return False
 
+
     def _predict(self):
-        seq = np.stack(self.buffer[:BUFFER_LEN], axis=0)   # (60, 543, 3)
+        seq    = np.stack(self.buffer[:BUFFER_LEN], axis=0)   # (60, 543, 3)
         seq_tf = tf.constant(seq, dtype=tf.float32)
 
-        # Preprocess → (1, 60, 708)
         features = self.preprocess(seq_tf)
         features = tf.cast(features, tf.float32)
 
-        # Padding lên đủ MAX_LEN (384) để khớp với đầu vào model
         T = tf.shape(features)[1]
         if T < MAX_LEN:
             pad = tf.fill([1, MAX_LEN - T, CHANNELS], PAD)
             features = tf.concat([features, pad], axis=1)
 
-        # Inference
         logits = self.model(features, training=False)
         probs  = tf.nn.softmax(logits[0]).numpy()
 
-        # Top-K
-        top_idx   = np.argsort(probs)[::-1][:self.topk]
+        top_idx = np.argsort(probs)[::-1][:self.topk]
         self.last_topk = [
             (self.label_map.get(i, f"class_{i}"),
              self.label_original.get(i, f"class_{i}"),
@@ -341,10 +421,22 @@ class SignPredictor:
             for i in top_idx
         ]
 
-        best_idx              = top_idx[0]
-        self.last_label       = self.label_map.get(best_idx, f"class_{best_idx}")
-        self.last_original    = self.label_original.get(best_idx, self.last_label)
-        self.last_confidence  = float(probs[best_idx])
+        best_idx  = top_idx[0]
+        raw_label = self.label_map.get(best_idx, f"class_{best_idx}")
+        raw_conf  = float(probs[best_idx])
+
+        # Smoothing: chỉ cập nhật kết quả nếu cùng tên 2/3 lần gần nhất
+        self._recent_labels.append(raw_label)
+        if len(self._recent_labels) > 3:
+            self._recent_labels.pop(0)
+
+        # Majority vote trong 3 kết quả gần nhất
+        from collections import Counter
+        vote = Counter(self._recent_labels).most_common(1)[0]
+        if vote[1] >= 2:  # ít nhất 2/3 lần cùng tên mới hiện
+            self.last_label      = raw_label
+            self.last_original   = self.label_original.get(best_idx, raw_label)
+            self.last_confidence = raw_conf
 
     def reset(self):
         self.buffer          = []
@@ -353,6 +445,8 @@ class SignPredictor:
         self.last_confidence = 0.0
         self.last_topk       = []
         self.is_detecting    = False
+        self._grace_count    = 0
+        self._recent_labels  = []
 
 
 # ─── DRAW OVERLAY ─────────────────────────────────────────────────────────────
@@ -360,122 +454,39 @@ class SignPredictor:
 def draw_overlay(frame: np.ndarray, predictor: SignPredictor,
                  buffer_size: int, topk: int):
     h, w, _ = frame.shape
-    panel_w = 300
     
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (panel_w, h), (15, 15, 15), -1)
-    alpha = 0.85
-    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-    cv2.putText(frame, "SignBridge AI", (10, 35),
-                cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
-    cv2.line(frame, (10, 50), (panel_w - 10, 50), (80, 80, 80), 1)
-
-    y = 80
-    cv2.putText(frame, "STATUS:", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-    y += 25
-
-    if predictor.hand_detected:
-        cv2.putText(frame, "DETECTING", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 1)
-    else:
-        cv2.putText(frame, "WAITING...", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 140, 255), 1)
-    y += 35
-
-    bar_w = panel_w - 20
-    fill_w = int((buffer_size / BUFFER_LEN) * bar_w)
-    cv2.rectangle(frame, (10, y), (10 + bar_w, y + 10), (50, 50, 50), -1)
-    cv2.rectangle(frame, (10, y), (10 + fill_w, y + 10), (0, 255, 0), -1)
-    y += 40
-
-    cv2.putText(frame, "PREDICTION:", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-    y += 35
-
     if predictor.last_label:
         conf_pct = predictor.last_confidence * 100
-        if conf_pct > 70: label_color = (0, 255, 0)
-        elif conf_pct > 40: label_color = (0, 200, 255)
-        else: label_color = (0, 0, 255)
-
-        label_display = predictor.last_original[:15]
-        cv2.putText(frame, label_display, (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.1, label_color, 2)
-        y += 45
-        cv2.putText(frame, f"({predictor.last_label})  {conf_pct:.1f}%",
-                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color, 1)
-    else:
-        cv2.putText(frame, "---", (10, y),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.0, (100, 100, 100), 2)
-
-    y += 35
-    cv2.line(frame, (10, y), (panel_w - 10, y), (80, 80, 80), 1)
-    y += 15
-
-    if predictor.last_topk:
-        cv2.putText(frame, f"TOP {topk}:", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
-        y += 22
-
-        for rank, (slug, orig, conf) in enumerate(predictor.last_topk[:topk]):
-            bar_fill  = int((panel_w - 20) * conf)
-            bar_color = (0, 140, 255) if rank == 0 else (60, 100, 160)
-
-            cv2.rectangle(frame, (10, y), (10 + bar_fill, y + 18), bar_color, -1)
-            cv2.rectangle(frame, (10, y), (panel_w - 10, y + 18), (80, 80, 80), 1)
-
-            label_txt = f"{rank+1}. {orig}  {conf*100:.0f}%"
-            cv2.putText(frame, label_txt, (14, y + 13),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            y += 25
-
-    guides = ["[R] Reset buffer", "[Q] Thoat", "[S] Chup man hinh"]
-    for i, g in enumerate(guides):
-        cv2.putText(frame, g, (10, h - 60 + i * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1)
-
-    # ─── CHỮ DỰ ĐOÁN SIÊU TO Ở GÓC DƯỚI BÊN PHẢI ───────────────────────────────
-    if predictor.last_label and predictor.last_confidence > 0.3:
-        conf_pct = predictor.last_confidence * 100
-        text = predictor.last_original
-        conf_text = f"{conf_pct:.0f}%"
-        font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 1.8
-        thickness = 3
-        (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
-        (conf_w, conf_h), _ = cv2.getTextSize(conf_text, font, 0.9, 2)
         
-        margin_x = 30
-        margin_y = 30
-        x_pos = w - text_w - margin_x
-        y_pos = h - margin_y - conf_h - 10
-
-        # Nền mờ đằng sau chữ để dễ đọc
-        bg_x1 = max(0, x_pos - 15)
-        bg_y1 = max(0, y_pos - text_h - 15)
-        bg_x2 = w
-        bg_y2 = h
-        bg_overlay = frame.copy()
-        cv2.rectangle(bg_overlay, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
-        frame = cv2.addWeighted(bg_overlay, 0.6, frame, 0.4, 0)
-
-        # Màu sắc theo mức độ tự tin
+        # Sử dụng predictor.last_label để lấy từ không dấu (như bạn yêu cầu) thay vì last_original
+        text = f"{predictor.last_label} : {conf_pct:.0f}%"
+        
         if conf_pct > 70:
-            label_color = (0, 255, 0)      # Xanh lá
-        elif conf_pct > 50:
-            label_color = (0, 200, 255)    # Vàng cam
+            color = (0, 255, 0) # Xanh lá
+        elif conf_pct > 40:
+            color = (0, 200, 255) # Vàng/Cam
         else:
-            label_color = (0, 140, 255)    # Cam
-
-        # Vẽ tên từ vựng
-        cv2.putText(frame, text, (x_pos, y_pos), font, font_scale, (0, 0, 0), thickness + 2)
-        cv2.putText(frame, text, (x_pos, y_pos), font, font_scale, label_color, thickness)
-        # Vẽ % phía dưới từ vựng
-        cv2.putText(frame, conf_text, (w - conf_w - margin_x, h - margin_y),
-                    font, 0.9, label_color, 2)
-
+            color = (0, 0, 255) # Đỏ
+            
+        font = cv2.FONT_HERSHEY_DUPLEX
+        font_scale = 1.5
+        thickness = 2
+        
+        # Lấy kích thước chữ để căn giữa và làm nền đen
+        (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        x = max(50, (w - text_width) // 2)
+        y = h - 50
+        
+        # Vẽ nền mờ đen
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x - 15, y - text_height - 15), (x + text_width + 15, y + 15), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        
+        # Vẽ viền chữ màu đen cho rõ nét, rồi mới vẽ màu thật đè lên trên
+        cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 0), thickness + 2)
+        cv2.putText(frame, text, (x, y), font, font_scale, color, thickness)
+        
     return frame
 
 
@@ -485,25 +496,33 @@ def run_camera(model_path: str = "", camera_idx: int = 0,
                topk: int = 3, dataset_dir: str = DEFAULT_DATASET_DIR):
     label_map, label_original = load_label_map(dataset_dir)
     model = load_model(model_path)
-    holistic, mp_holistic, mp_drawing, mp_drawing_styles = init_mediapipe()
-    predictor = SignPredictor(model, label_map, label_original, topk=topk)
+    landmarker = init_mediapipe()   # HolisticLandmarker (Tasks API)
+    predictor  = SignPredictor(model, label_map, label_original, topk=topk)
 
     cap = cv2.VideoCapture(camera_idx)
     if not cap.isOpened():
         print(f"[ERROR] Không mở được camera {camera_idx}")
+        landmarker.close()
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    print("\n[INFO] Camera đang chạy.")
+    # Đặt kích thước camera nhỏ lại
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
     
-    os.makedirs("captures", exist_ok=True)
-    frame_count = 0
-    fps_time    = time.time()
-    fps         = 0.0
+    cv2.namedWindow("SignBridge AI", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("SignBridge AI", 800, 600)
 
-    with holistic:
+    print("\n[INFO] Camera đang chạy (Tasks API MediaPipe 0.10+).")
+    os.makedirs("captures", exist_ok=True)
+
+    frame_count   = 0
+    fps_time      = time.time()
+    fps           = 0.0
+    current_ms    = 0          # timestamp tăng dần cho detect_for_video
+    cap_fps       = cap.get(cv2.CAP_PROP_FPS)
+    frame_ms      = int(1000 / cap_fps) if cap_fps > 0 else 33  # ~30fps
+
+    try:
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -511,45 +530,37 @@ def run_camera(model_path: str = "", camera_idx: int = 0,
 
             frame_count += 1
             if frame_count % 30 == 0:
-                fps = 30 / (time.time() - fps_time)
+                fps      = 30 / (time.time() - fps_time)
                 fps_time = time.time()
 
-            # BƯỚC 1: XỬ LÝ KHUNG HÌNH GỐC (CHƯA LẬT) ĐỂ KHÔNG BỊ NGƯỢC TAY!
-            # Mô hình train trên tay phải/trái gốc, nếu lật trước khi đưa vào MediaPipe, 
-            # tay phải của bạn sẽ bị nhận diện nhầm thành tay trái (Mirror Effect)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = holistic.process(rgb)
-            rgb.flags.writeable = True
+            # BƯỚC 1: XỬ LÝ KHUNG HÌNH GỐC (CHƯA LẬT)
+            # MediaPipe sẽ xử lý frame gốc để lấy toạ độ chuẩn không bị ngược trái/phải
+            # (khớp hoàn toàn với dữ liệu training).
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            results  = landmarker.detect_for_video(mp_image, current_ms)
+            current_ms += frame_ms
 
             # Trích xuất 543 điểm chuẩn để đưa vào model
             vec = extract_holistic(results)
             predictor.push_frame(vec)
 
-            # Vẽ skeleton lên frame CHƯA LẬT
-            if results.face_landmarks:
-                mp_drawing.draw_landmarks(frame, results.face_landmarks, mp_holistic.FACEMESH_TESSELATION, 
-                    mp_drawing_styles.get_default_face_mesh_tesselation_style())
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS,
-                    mp_drawing_styles.get_default_pose_landmarks_style())
-            if results.left_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style())
-            if results.right_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style())
+            # Vẽ skeleton lên frame CHƯA LẬT (để toạ độ vẽ khớp với ảnh gốc)
+            draw_landmarks_cv2(frame, results)
 
             # BƯỚC 2: LẬT KHUNG HÌNH (MIRROR) ĐỂ HIỂN THỊ CHO NGƯỜI DÙNG DỄ NHÌN
-            # Lúc này ảnh và skeleton sẽ lật lại như soi gương
             frame = cv2.flip(frame, 1)
 
-            # BƯỚC 3: VẼ GIAO DIỆN CHỮ LÊN KHUNG HÌNH (Lúc này chữ không bị lật ngược)
+            # BƯỚC 3: VẼ GIAO DIỆN CHỮ LÊN KHUNG HÌNH (lúc này chữ không bị lật ngược)
             frame = draw_overlay(frame, predictor, len(predictor.buffer), topk)
             cv2.putText(frame, f"FPS: {fps:.0f}", (frame.shape[1] - 90, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             cv2.imshow("SignBridge AI", frame)
+
+            # Hỗ trợ bấm nút X trên cửa sổ để tắt
+            if cv2.getWindowProperty("SignBridge AI", cv2.WND_PROP_VISIBLE) < 1:
+                break
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:
@@ -559,9 +570,10 @@ def run_camera(model_path: str = "", camera_idx: int = 0,
             elif key == ord('s'):
                 fname = f"captures/capture_{int(time.time())}.png"
                 cv2.imwrite(fname, frame)
-
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        cap.release()
+        landmarker.close()
+        cv2.destroyAllWindows()
 
 
 def main():
