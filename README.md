@@ -13,12 +13,13 @@ Real-time Vietnamese sign language recognition using a **Transformer + Causal DW
 
 ## Hardware Support
 
-| Environment | Compute |
+| Environment | Compute Support |
 |---|---|
-| Local machine (Windows/Linux/macOS) | **CPU only** (Highly Optimized) |
-| Google Colab | **TPU** (For Training) |
+| Local Machine (Windows / macOS) | **CPU** (Highly Optimized via TFLite Multi-threading) |
+| Local Machine (Linux / Windows WSL2) | **GPU** (NVIDIA CUDA + cuDNN required) |
+| Google Colab / Kaggle | **GPU / TPU** (Recommended for Training) |
 
-> GPU is **not required**. The TFLite inference pipeline runs exceptionally well on standard laptop CPUs.
+> ⚠️ **Note on Windows GPU Support:** Starting from TensorFlow 2.11+, native GPU support on Windows was dropped. To train using a GPU on Windows, you must use **WSL2** (Windows Subsystem for Linux 2) or run the code on Linux/Google Colab. The TFLite inference pipeline (`camera_demo_tflite.py`) is designed to run exceptionally well on standard laptop CPUs.
 
 ---
 

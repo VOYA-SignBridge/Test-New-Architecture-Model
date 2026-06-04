@@ -549,7 +549,10 @@ class CFG:
     verbose = 2
     
     max_len = 384
-    replicas = 8
+    # QUAN TRọNG: replicas/batch_size/lr sẽ được cập nhật động
+    # dựa vào số GPU thực tế sau khi khởi tạo STRATEGY.
+    # Các giá trị dưới đây là mặc định cho CPU (1 replica)
+    replicas = 1
     lr = 5e-4 * replicas
     weight_decay = 0.1
     lr_min = 1e-6
@@ -570,40 +573,63 @@ class CFG:
     dim = 192
     comment = f'islr-fp16-192-8-seed{seed}'
 
-def get_strategy(device='TPU'):
+def get_strategy(device='GPU'):
+    IS_TPU = False
+    
     if "TPU" in device:
-        tpu = 'local' if device=='TPU-VM' else None
-        print("connecting to TPU...")
-        tpu = tf.distribute.cluster_resolver.TPUClusterResolver.connect(tpu=tpu)
-        strategy = tf.distribute.TPUStrategy(tpu)
-        IS_TPU = True
+        try:
+            tpu = 'local' if device=='TPU-VM' else None
+            print("[INFO] Đang kết nối tới TPU...")
+            tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect(tpu=tpu)
+            strategy = tf.distribute.TPUStrategy(tpu_resolver)
+            IS_TPU = True
+            print("[INFO] Sử dụng TPU Strategy")
+        except Exception as e:
+            print(f"[WARN] Không kết nối được TPU ({e}). Chuyển sang GPU/CPU.")
+            device = "GPU"
 
-    if device == "GPU"  or device=="CPU":
-        ngpu = len(tf.config.experimental.list_physical_devices('GPU'))
-        if ngpu>1:
-            print("Using multi GPU")
-            strategy = tf.distribute.MirroredStrategy()
-        elif ngpu==1:
-            print("Using single GPU")
-            strategy = tf.distribute.get_strategy()
+    if device == "GPU" or device == "CPU":
+        # 1. Lấy danh sách GPU thực tế
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            # 2. Bật Memory Growth để tránh lỗi OOM (Out Of Memory)
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print(f"[INFO] ✅ Đã tìm thấy {len(gpus)} GPU. Đã kích hoạt Memory Growth.")
+            except RuntimeError as e:
+                print(f"[WARN] Lỗi khi cài đặt Memory Growth: {e}")
+                
+            if len(gpus) > 1:
+                print("[INFO] Sử dụng Multi-GPU (MirroredStrategy)")
+                strategy = tf.distribute.MirroredStrategy()
+            else:
+                print("[INFO] Sử dụng Single GPU (Default Strategy)")
+                # Default strategy tự động dùng GPU:0 nếu có
+                strategy = tf.distribute.get_strategy() 
         else:
-            print("Using CPU")
+            print("[INFO] ⚠️ Không tìm thấy GPU tương thích. Hệ thống sẽ huấn luyện bằng CPU.")
             strategy = tf.distribute.get_strategy()
-            CFG.device = "CPU"
 
-    if device == "GPU":
-        print("Num GPUs Available: ", ngpu)
-
-    AUTO     = tf.data.experimental.AUTOTUNE
     REPLICAS = strategy.num_replicas_in_sync
-    print(f'REPLICAS: {REPLICAS}')
+    print(f'[INFO] Số lượng REPLICAS (Luồng đồng bộ): {REPLICAS}')
     
     return strategy, REPLICAS, IS_TPU
 
+# Khởi tạo chiến lược phân phối (Mặc định ưu tiên GPU)
 try:
     STRATEGY, N_REPLICAS, IS_TPU = get_strategy(device="GPU")
-except:
+except Exception as e:
+    print(f"[ERROR] Lỗi khởi tạo phân phối: {e}")
     STRATEGY = tf.distribute.get_strategy()
+    N_REPLICAS = 1
+    IS_TPU = False
+
+# ↺ Cập nhật CFG theo số replica thực tế — đảm bảo batch_size/lr đúng trên mọi nền tảng
+CFG.replicas   = N_REPLICAS
+CFG.batch_size = 64 * N_REPLICAS
+CFG.lr         = 5e-4 * N_REPLICAS
+print(f"[INFO] Cấu hình: replicas={CFG.replicas} | batch_size={CFG.batch_size} | lr={CFG.lr:.2e}")
 
 # ─── TRAINING LOOP ────────────────────────────────────────────────────────────
 def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summary=True):
@@ -611,7 +637,9 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
     os.makedirs(CFG.output_dir, exist_ok=True)   # Tạo thư mục output khi bắt đầu train
     tf.keras.backend.clear_session()
     gc.collect()
-    tf.config.optimizer.set_jit(True)
+    # XLA JIT: Chỉ bật trên TPU/Linux (ổn định). Trên Windows GPU có thể gây crash im lặng.
+    if IS_TPU:
+        tf.config.optimizer.set_jit(True)
 
     if CFG.fp16:
         try:
