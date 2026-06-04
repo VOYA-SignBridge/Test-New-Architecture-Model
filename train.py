@@ -548,42 +548,57 @@ def get_model(max_len=64, dropout_step=0, dim=192):
     return tf.keras.Model(inp, x)
 
 # ─── TRAINING CONFIG ──────────────────────────────────────────────────────────
+# Tham khảo: notebook Kaggle 1st place (Hoyeol Sohn) — ISLR 2023
+# Dataset gốc: 250 class, ~94k mẫu, chạy trên TPU v3-8 (8 replicas)
 class CFG:
-    n_splits = 5
-    save_output = True
+    n_splits    = 5     # Số fold Cross-Validation (5-fold = chia dataset ra 5 phần)
+    save_output = True  # True = Lưu weights + logs ra thư mục output
 
     _now = datetime.datetime.now()
     output_dir = f"output/{_now.hour}-{_now.minute}-{_now.day}-{_now.month}-{_now.year}"
     # ⚠️ os.makedirs được gọi trong train_fold() thay vì ở đây
     # để tránh tạo thư mục mỗi lần import train.py (vd: từ camera_demo.py)
     
-    seed = 42
-    verbose = 2
+    seed    = 42   # Random seed — giữ nguyên để kết quả tái hiện được
+    verbose = 2    # 0=im lặng | 1=progress bar | 2=1 dòng/epoch (khuyến nghị)
+
+    max_len = 384  # Số frame tối đa mỗi chuỗi (Gốc Kaggle = 384)
+                   # ↓ Giảm xuống 60-128 để train nhanh hơn trên CPU
+                   # ↑ Tăng nếu ký hiệu dài hơn 5 giây @ 30fps
+
+    # QUAN TRỌNG: 3 thông số dưới được TỰ ĐỘNG CẬP NHẬT theo số GPU/TPU thực tế
+    # (tại dòng CFG.replicas = N_REPLICAS sau khi init STRATEGY)
+    replicas   = 1              # Gốc Kaggle TPU-8 = 8 replicas
+    batch_size = 64 * replicas  # Gốc = 512 (64×8). ↓32 nếu OOM, ↑128 nếu RAM dư
+    lr         = 5e-4 * replicas  # Gốc = 4e-3 (5e-4×8) — Linear Scaling Rule
+
+    weight_decay = 0.1    # L2 regularization — giảm overfitting
+    lr_min       = 1e-6   # LR sàn cuối chu kỳ cosine
+    warmup       = 0      # Tỷ lệ warmup (tăng 0.05-0.1 nếu loss bất ổn epoch đầu)
+    decay_type   = 'cosine'  # Kiểu giảm LR: 'cosine' (mượt) hoặc 'linear'
+
+    epoch = 50  # Gốc Kaggle = 300 (TPU, 94k mẫu)
+                # <500 mẫu → 30-50  |  500-2k → 50-100  |  >2k → 100-200
+
+    snapshot_epochs = []  # Epoch muốn lưu snapshot riêng VD: [200,250,300]. [] = tắt
+    swa_epochs      = []  # Epoch dùng SWA (trung bình weights). [] = tắt khi data nhỏ
     
-    max_len = 384
-    # QUAN TRọNG: replicas/batch_size/lr sẽ được cập nhật động
-    # dựa vào số GPU thực tế sau khi khởi tạo STRATEGY.
-    # Các giá trị dưới đây là mặc định cho CPU (1 replica)
-    replicas = 1
-    lr = 5e-4 * replicas
-    weight_decay = 0.1
-    lr_min = 1e-6
-    epoch = 50
-    warmup = 0
-    batch_size = 64 * replicas
-    snapshot_epochs = []
-    swa_epochs = []
-    
-    fp16 = True
-    fgm = False
-    awp = True
-    awp_lambda = 0.2
-    awp_start_epoch = 15
-    dropout_start_epoch = 15
-    resume = 0
-    decay_type = 'cosine'
-    dim = 192
-    comment = f'islr-fp16-192-8-seed{seed}'
+    fp16 = True   # Mixed precision (bfloat16/float16) — tiết kiệm RAM, tăng tốc GPU
+                  # False = float32, ổn định hơn khi gặp NaN loss
+
+    fgm             = False  # Fast Gradient Method — tắt (dễ conflict với tf-addons)
+    awp             = True   # Adversarial Weight Perturbation — tăng robustness
+    awp_lambda      = 0.2    # Độ mạnh AWP (Gốc=0.2, tăng 0.3-0.5 nếu vẫn overfit)
+    awp_start_epoch = 15     # Bắt đầu AWP từ epoch 15 (đợi model hội tụ sơ trước)
+
+    dropout_start_epoch = 15  # LateDropout bật từ epoch 15 (epoch đầu cần gradient mạnh)
+
+    resume = 0  # 0 = train từ đầu | N = tiếp tục từ epoch N (load weights output_dir)
+
+    dim = 192   # Hidden dimension Transformer (Gốc Kaggle = 192, ~1.7M params)
+                # Tăng 384 = model lớn 4x (~6.5M params), cần nhiều RAM/VRAM hơn
+
+    comment = f'islr-fp16-{dim}-seed{seed}'  # Prefix tên file weights và logs
 
 def get_strategy(device='GPU'):
     IS_TPU = False
@@ -666,7 +681,7 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
 
     if fold != "all":
         train_ds = get_tfrec_dataset(train_files, batch_size=CFG.batch_size,
-                                     max_len=CFG.max_len, drop_remainder=True,
+                                     max_len=CFG.max_len, drop_remainder=False,  # False = không bỏ batch lẻ cuối
                                      augment=True, repeat=True, shuffle=32768)
         valid_ds = get_tfrec_dataset(valid_files, batch_size=CFG.batch_size,
                                      max_len=CFG.max_len, drop_remainder=False,
@@ -680,7 +695,8 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
 
     num_train = count_data_items(train_files)
     num_valid = count_data_items(valid_files)
-    steps_per_epoch = max(1, num_train // CFG.batch_size)
+    # Ceiling division: đảm bảo steps_per_epoch >= 1 kể cả khi num_train < batch_size
+    steps_per_epoch = max(1, -(int(num_train) // -CFG.batch_size))
 
     with strategy.scope():
         dropout_step = CFG.dropout_start_epoch * steps_per_epoch
@@ -792,7 +808,7 @@ def train_fold(CFG, fold, train_files, valid_files=None, strategy=STRATEGY, summ
         callbacks=callbacks,
         validation_data=valid_ds,
         verbose=CFG.verbose,
-        validation_steps=-(num_valid // -CFG.batch_size)
+        validation_steps=max(0, -(int(num_valid) // -CFG.batch_size))
     )
 
     if CFG.save_output:

@@ -37,41 +37,41 @@ def main():
             video_name = Path(row['VIDEO']).stem
             video_to_label[video_name] = row['LABEL']
             
-    # 2. Xây dựng label_to_id từ TOÀN BỘ nhãn trong CSV (nguồn sự thật)
-    # QUAN TRỌNG: Phải lấy từ CSV, KHÔNG lấy từ .npy files đang có,
-    # để đảm bảo ID ổn định khi bạn extract thêm data sau này.
-    all_labels = sorted(set(video_to_label.values()))
-    label_to_id = {label: idx for idx, label in enumerate(all_labels)}
-
-    # Lưu mapping TRƯỚC khi lọc .npy — đảm bảo label_map.json luôn đầy đủ tất cả classes
-    map_file = os.path.join(out_dir, 'label_map.json')
-    with open(map_file, 'w', encoding='utf-8') as f:
-        json.dump(label_to_id, f, ensure_ascii=False, indent=4)
-    print(f"Đã lập bản đồ cho {len(label_to_id)} nhãn (classes) từ CSV.")
-
-    # 3. Quét các file .npy đã trích xuất MediaPipe
+    # 2. Quét các file .npy đã trích xuất MediaPipe
     npy_files = glob.glob(os.path.join(pt_dir, "*.npy"))
     if not npy_files:
         print(f"Không tìm thấy file .npy nào trong {pt_dir}")
         return
-        
+
     print(f"Tìm thấy {len(npy_files)} file .npy để ghép.")
 
-    # 4. Lọc các video có cả .npy lẫn nhãn trong CSV
-    valid_videos = []
+    # 3. Ghép .npy với nhãn từ CSV
+    #    Nhiều video khác nhau có thể cùng 1 nhãn (ví dụ D0001B và D0023B cùng là "địa chỉ (bắc)")
+    #    → Đếm số nhãn UNIQUE trong các video có .npy mới là NUM_CLASSES đúng
+    valid_videos  = []
+    present_labels = set()
+
     for npy_file in npy_files:
         video_name = Path(npy_file).stem.replace("_mediapipe", "")
         if video_name in video_to_label:
-            valid_videos.append((npy_file, video_to_label[video_name]))
+            label_str = video_to_label[video_name]
+            valid_videos.append((npy_file, label_str))
+            present_labels.add(label_str)          # ← chỉ thêm nhãn mới nếu chưa có
         else:
             print(f"[Cảnh báo] Video {video_name} không có trong file label CSV. Đã bỏ qua!")
-    
-    covered = set(label for _, label in valid_videos)
-    missing = set(all_labels) - covered
-    if missing:
-        print(f"[INFO] {len(covered)}/{len(all_labels)} classes có dữ liệu .npy. Chưa có: {sorted(missing)}")
 
-    # Cập nhật ID cho valid_videos
+    # Sắp xếp A-Z để ID ổn định, sau đó gắn số thứ tự 0..N-1
+    sorted_labels = sorted(present_labels)
+    label_to_id   = {label: idx for idx, label in enumerate(sorted_labels)}
+
+    print(f"Số nhãn UNIQUE từ {len(valid_videos)} video có .npy: {len(label_to_id)} classes")
+
+    # Lưu label_map.json
+    map_file = os.path.join(out_dir, "label_map.json")
+    with open(map_file, "w", encoding="utf-8") as f:
+        json.dump(label_to_id, f, ensure_ascii=False, indent=4)
+
+    # Cập nhật ID cho dataset
     dataset = [(pt_file, label_to_id[label_str]) for pt_file, label_str in valid_videos]
     
     # 4. Trộn ngẫu nhiên và chia thành 5 folds (để Cross Validation)
