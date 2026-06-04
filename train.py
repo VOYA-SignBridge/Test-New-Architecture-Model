@@ -90,8 +90,20 @@ if MAX_VIDEOS is not None:
 ROWS_PER_FRAME = 543
 MAX_LEN = 384
 CROP_LEN = MAX_LEN
-NUM_CLASSES  = 4
 PAD = -100.
+
+# Tự động đọc NUM_CLASSES từ label_map.json được tạo bởi prepare_tfrecords.py
+_label_map_path = os.path.join(DATA_DIR, "label_map.json")
+if os.path.exists(_label_map_path):
+    import json as _json
+    with open(_label_map_path, "r", encoding="utf-8") as _f:
+        _label_data = _json.load(_f)
+    NUM_CLASSES = len(_label_data)
+    print(f"[INFO] Tự động phát hiện NUM_CLASSES = {NUM_CLASSES} (từ {_label_map_path})")
+else:
+    NUM_CLASSES = 4
+    print(f"[WARN] Không tìm thấy {_label_map_path}. Dùng NUM_CLASSES mặc định = {NUM_CLASSES}")
+
 
 # ─── LANDMARK GROUPS ──────────────────────────────────────────────────────────
 NOSE   = [1, 2, 98, 327]

@@ -37,38 +37,40 @@ def main():
             video_name = Path(row['VIDEO']).stem
             video_to_label[video_name] = row['LABEL']
             
-    # 2. Quét các file .npy đã trích xuất MediaPipe
+    # 2. Xây dựng label_to_id từ TOÀN BỘ nhãn trong CSV (nguồn sự thật)
+    # QUAN TRỌNG: Phải lấy từ CSV, KHÔNG lấy từ .npy files đang có,
+    # để đảm bảo ID ổn định khi bạn extract thêm data sau này.
+    all_labels = sorted(set(video_to_label.values()))
+    label_to_id = {label: idx for idx, label in enumerate(all_labels)}
+
+    # Lưu mapping TRƯỚC khi lọc .npy — đảm bảo label_map.json luôn đầy đủ tất cả classes
+    map_file = os.path.join(out_dir, 'label_map.json')
+    with open(map_file, 'w', encoding='utf-8') as f:
+        json.dump(label_to_id, f, ensure_ascii=False, indent=4)
+    print(f"Đã lập bản đồ cho {len(label_to_id)} nhãn (classes) từ CSV.")
+
+    # 3. Quét các file .npy đã trích xuất MediaPipe
     npy_files = glob.glob(os.path.join(pt_dir, "*.npy"))
     if not npy_files:
         print(f"Không tìm thấy file .npy nào trong {pt_dir}")
         return
         
     print(f"Tìm thấy {len(npy_files)} file .npy để ghép.")
-    
-    # 3. Lọc danh sách và cấp mã ID cho các Label có tồn tại
+
+    # 4. Lọc các video có cả .npy lẫn nhãn trong CSV
     valid_videos = []
-    present_labels = set()
-    
     for npy_file in npy_files:
         video_name = Path(npy_file).stem.replace("_mediapipe", "")
         if video_name in video_to_label:
-            label_str = video_to_label[video_name]
-            valid_videos.append((npy_file, label_str))
-            present_labels.add(label_str)
+            valid_videos.append((npy_file, video_to_label[video_name]))
         else:
             print(f"[Cảnh báo] Video {video_name} không có trong file label CSV. Đã bỏ qua!")
-            
-    # Sắp xếp theo thứ tự A-Z và gắn số thứ tự từ 0 đến N-1
-    sorted_labels = sorted(list(present_labels))
-    label_to_id = {label: idx for idx, label in enumerate(sorted_labels)}
     
-    # Lưu lại mapping để sau này chạy ứng dụng thực tế còn biết dự đoán số mấy là chữ gì
-    map_file = os.path.join(out_dir, 'label_map.json')
-    with open(map_file, 'w', encoding='utf-8') as f:
-        json.dump(label_to_id, f, ensure_ascii=False, indent=4)
-        
-    print(f"Đã lập bản đồ cho {len(label_to_id)} nhãn (classes).")
-    
+    covered = set(label for _, label in valid_videos)
+    missing = set(all_labels) - covered
+    if missing:
+        print(f"[INFO] {len(covered)}/{len(all_labels)} classes có dữ liệu .npy. Chưa có: {sorted(missing)}")
+
     # Cập nhật ID cho valid_videos
     dataset = [(pt_file, label_to_id[label_str]) for pt_file, label_str in valid_videos]
     
@@ -107,8 +109,8 @@ def main():
                 
         print(f"Đã lưu: {tfrec_name} ({count} videos)")
         
-    print("\n[HOÀN TẤT THÀNH CÔNG] Dữ liệu đã sẵn sàng để train!")
-    print(f"⚠️ QUAN TRỌNG: Bạn BẮT BUỘC phải sửa biến NUM_CLASSES = {len(label_to_id)} trong file train.py trước khi chạy train.py nhé!")
+    print("\n✅ [HOÀN TẤT] Dữ liệu đã sẵn sàng để train!")
+    print(f"   Số lượng classes: {len(label_to_id)} → train.py sẽ tự động đọc từ label_map.json")
 
 if __name__ == "__main__":
     main()
