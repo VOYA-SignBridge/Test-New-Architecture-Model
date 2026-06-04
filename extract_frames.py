@@ -38,6 +38,11 @@ def extract_frames(video_path, output_dir, video_name, fps=30):
         print(f"\n[LỖI] Không thể xử lý video {video_path}: {e.stderr.decode('utf-8')}")
         return False
 
+# ============================================================================
+# CẤU HÌNH SỐ LƯỢNG VIDEO CẦN TRÍCH XUẤT
+# ============================================================================
+MAX_VIDEOS = None  # Đổi None thành số nguyên (ví dụ: 10, 50) để giới hạn số video trích xuất. None = tất cả
+
 def main():
     dataset_dir = os.path.join("dataset", "Vietnamese")
     data_dir = os.path.join("data", "Vietnamese", "frames")
@@ -49,7 +54,11 @@ def main():
         print(f"Không tìm thấy file .mp4 nào trong thư mục {dataset_dir}")
         return
         
-    print(f"Tìm thấy {len(video_files)} video. Bắt đầu trích xuất frames ở tốc độ 30 FPS...")
+    # Áp dụng giới hạn số lượng video nếu được thiết lập
+    if MAX_VIDEOS is not None:
+        video_files = video_files[:MAX_VIDEOS]
+        
+    print(f"Tìm thấy {len(video_files)} video để xử lý. Bắt đầu trích xuất frames ở tốc độ 30 FPS...")
     
     # Hàm đóng gói để truyền vào luồng xử lý
     def process_video(video_path):
