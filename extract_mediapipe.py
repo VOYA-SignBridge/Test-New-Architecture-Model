@@ -12,8 +12,8 @@ from tqdm import tqdm
 # ============================================================================
 # CẤU HÌNH: Số lượng video và bộ lọc
 # ============================================================================
-MAX_VIDEOS = 5          # None = tất cả video; số nguyên = số video muốn xử lý
-FILTER_SUFFIX = "N"       # Lọc video có chữ này ở cuối tên (ví dụ: "N" -> D0001N)
+MAX_VIDEOS = 10          # None = tất cả video; số nguyên = số video muốn xử lý
+FILTER_SUFFIX = None       # Lọc video có chữ này ở cuối tên (ví dụ: "N" -> D0001N)
                            # Đặt = None để bỏ qua bộ lọc
 
 # Cấu hình Mô hình

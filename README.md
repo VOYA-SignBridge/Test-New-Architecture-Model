@@ -26,13 +26,12 @@ Real-time Vietnamese sign language recognition using a **Transformer + Causal DW
 ## Project Structure
 
 ```
-├── extract_frames.py       # Step 1: Extract frames from videos
-├── extract_mediapipe.py    # Step 2: Extract 543 body landmarks via Hybrid MediaPipe
-├── prepare_tfrecords.py    # Step 3: Pack .npy matrices into TFRecord files
-├── train.py                # Step 4: Train the model
-├── export_tflite.py        # Step 5: Convert trained weights to TFLite
-├── camera_demo.py          # Step 6: Real-time inference (Standard Keras - Debug)
-├── camera_demo_tflite.py   # Step 6: Real-time inference (TFLite Engine - Production)
+├── extract_mediapipe.py    # Step 1: Extract 543 body landmarks via Hybrid MediaPipe
+├── prepare_tfrecords.py    # Step 2: Pack .npy matrices into TFRecord files
+├── train.py                # Step 3: Train the model
+├── export_tflite.py        # Step 4: Convert trained weights to TFLite
+├── camera_demo.py          # Step 5: Real-time inference (Standard Keras - Debug)
+├── camera_demo_tflite.py   # Step 5: Real-time inference (TFLite Engine - Production)
 │
 ├── holistic_landmarker.task   # Auto-downloaded MediaPipe model
 ├── hand_landmarker.task       # Auto-downloaded MediaPipe model
@@ -40,9 +39,8 @@ Real-time Vietnamese sign language recognition using a **Transformer + Causal DW
 │
 ├── dataset/Vietnamese/        # Raw videos + label CSV
 ├── data/Vietnamese/
-│   ├── frames/                # Output of Step 1
-│   ├── mediapipe/             # Output of Step 2 (.npy matrices)
-│   └── TFRecord/              # Output of Step 3 (.tfrecords + label_map.json)
+│   ├── mediapipe/             # Output of Step 1 (.npy matrices)
+│   └── TFRecord/              # Output of Step 2 (.tfrecords + label_map.json)
 └── output/                    # Training output (weights + logs + tflite)
 ```
 
@@ -68,15 +66,7 @@ pip install -r requirements.txt
 
 ## Full Pipeline Guide
 
-### Step 1 — Extract frames
-```bash
-python extract_frames.py
-```
-Reads videos from `dataset/Vietnamese/` → saves frames to `data/Vietnamese/frames/`.
-
----
-
-### Step 2 — Extract MediaPipe landmarks
+### Step 1 — Extract MediaPipe landmarks
 ```bash
 python extract_mediapipe.py
 ```
@@ -85,7 +75,7 @@ Reads videos → extracts 543 body keypoints (face, hands, pose) per frame using
 
 ---
 
-### Step 3 — Build TFRecord dataset
+### Step 2 — Build TFRecord dataset
 ```bash
 python prepare_tfrecords.py
 ```
@@ -93,7 +83,7 @@ Reads `.npy` files + label CSV → packages into 5-fold `.tfrecords` files in `d
 
 ---
 
-### Step 4 — Train the model
+### Step 3 — Train the model
 ```bash
 python train.py
 ```
@@ -104,7 +94,7 @@ Results are saved to `output/[timestamp]/`:
 
 ---
 
-### Step 5 — Export to TFLite (Optional/Manual)
+### Step 4 — Export to TFLite (Optional/Manual)
 *Note: `train.py` might auto-export at the end. If you need to re-export manually:*
 ```bash
 python export_tflite.py
@@ -113,7 +103,7 @@ Compresses the standard Keras weights into an optimized `float16` `.tflite` mode
 
 ---
 
-### Step 6 — Run webcam demo (Production)
+### Step 5 — Run webcam demo (Production)
 
 **We highly recommend using the TFLite version** for significantly better FPS and lower resource usage. Both versions feature identical EMA Temporal Tracking.
 
