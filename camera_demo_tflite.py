@@ -24,13 +24,11 @@ except ImportError:
 
 try:
     import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision as mp_vision
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import components, vision
 except ImportError:
     print("[ERROR] Thiếu mediapipe. Chạy: pip install mediapipe")
     sys.exit(1)
-
-import urllib.request
 
 try:
     import tensorflow as tf
@@ -38,6 +36,8 @@ except ImportError:
     print("[ERROR] Thiếu tensorflow. Chạy: pip install tensorflow")
     sys.exit(1)
 
+from PIL import Image, ImageDraw, ImageFont
+from concurrent.futures import ThreadPoolExecutor
 
 # ─── CONSTANTS ───────────────────────────────────────────────────────────────
 MAX_LEN         = 384
@@ -507,10 +507,9 @@ def draw_overlay(frame: np.ndarray, predictor: SignPredictorTFLite,
                  buffer_size: int, topk: int):
     h, w, _ = frame.shape
     
-    if predictor.last_label:
+    if predictor.last_original:
         conf_pct = predictor.last_confidence * 100
-        
-        text = f"{predictor.last_label} : {conf_pct:.0f}%"
+        text = f"{predictor.last_original} : {conf_pct:.0f}%"
         
         if conf_pct > 70:
             color = (0, 255, 0) # Xanh lá
@@ -519,28 +518,40 @@ def draw_overlay(frame: np.ndarray, predictor: SignPredictorTFLite,
         else:
             color = (0, 0, 255) # Đỏ
             
-        font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 1.5
-        thickness = 2
+        # Chuyển OpenCV frame (BGR) sang PIL Image (RGBA)
+        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert('RGBA')
+        draw = ImageDraw.Draw(img_pil)
         
-        (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        # Load font Tiếng Việt chuẩn
+        try:
+            font = ImageFont.truetype("arial.ttf", 45)
+        except IOError:
+            font = ImageFont.load_default()
+            
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
         
-        x = max(50, (w - text_width) // 2)
-        y = h - 50
+        x = max(50, (w - text_w) // 2)
+        y = h - text_h - 40
         
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x - 15, y - text_height - 15), (x + text_width + 15, y + 15), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        # Vẽ nền mờ
+        draw.rectangle([x - 20, y - 10, x + text_w + 20, y + text_h + 15], fill=(0, 0, 0, 150))
         
-        cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 0), thickness + 2)
-        cv2.putText(frame, text, (x, y), font, font_scale, color, thickness)
+        # Vẽ viền chữ đen
+        for dx in [-2, 0, 2]:
+            for dy in [-2, 0, 2]:
+                draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255))
+        
+        # Vẽ chữ thật
+        draw.text((x, y), text, font=font, fill=(color[2], color[1], color[0], 255))
+        
+        frame = cv2.cvtColor(np.array(img_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
         
     return frame
 
 
 def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
-    from concurrent.futures import ThreadPoolExecutor
-    
     label_map, label_original = load_label_map()
     interpreter, input_details, output_details = load_tflite_model(model_path)
     holistic_model, hand_model = init_mediapipe()
