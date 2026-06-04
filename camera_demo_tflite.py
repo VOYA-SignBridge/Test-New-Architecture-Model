@@ -24,9 +24,13 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
 except ImportError:
     print("[ERROR] Thiếu mediapipe. Chạy: pip install mediapipe")
     sys.exit(1)
+
+import urllib.request
 
 try:
     import tensorflow as tf
@@ -62,6 +66,31 @@ CHANNELS        = 6 * NUM_NODES
 
 DEFAULT_MODEL_DIR = "./output"
 
+HOLISTIC_MODEL_PATH = "holistic_landmarker.task"
+HOLISTIC_URL = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
+
+HANDS_MODEL_PATH = "hand_landmarker.task"
+HANDS_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+
+FACE_START,  FACE_END   = 0,   468
+LHAND_START, LHAND_END  = 468, 489
+POSE_START,  POSE_END   = 489, 522
+RHAND_START, RHAND_END  = 522, 543
+
+def _ensure_mp_model():
+    """Tải model MediaPipe nếu chưa có."""
+    downloaded = False
+    if not os.path.exists(HOLISTIC_MODEL_PATH):
+        print(f"[INFO] Đang tải model Holistic ({HOLISTIC_MODEL_PATH})...")
+        urllib.request.urlretrieve(HOLISTIC_URL, HOLISTIC_MODEL_PATH)
+        downloaded = True
+    if not os.path.exists(HANDS_MODEL_PATH):
+        print(f"[INFO] Đang tải model Hand ({HANDS_MODEL_PATH})...")
+        urllib.request.urlretrieve(HANDS_URL, HANDS_MODEL_PATH)
+        downloaded = True
+    if downloaded:
+        print("[INFO] Đã tải đủ các mô hình MediaPipe!")
+
 
 # ─── LOAD LABEL MAP ───────────────────────────────────────────────────────────
 def load_label_map():
@@ -85,34 +114,155 @@ def load_label_map():
     return label_map, label_original
 
 
-# ─── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
+# ─── MEDIAPIPE SETUP (Tasks API) ──────────────────────────────────────────────
 def init_mediapipe():
-    mp_holistic = mp.solutions.holistic
-    holistic = mp_holistic.Holistic(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.7,
-        model_complexity=1
+    """Khởi tạo HolisticLandmarker và HandLandmarker dùng MediaPipe Tasks API."""
+    _ensure_mp_model()
+    
+    # 1. Holistic
+    holistic_base = mp_python.BaseOptions(model_asset_path=HOLISTIC_MODEL_PATH)
+    holistic_options = mp_vision.HolisticLandmarkerOptions(
+        base_options=holistic_base,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        min_face_detection_confidence=0.5,
+        min_face_landmarks_confidence=0.5,
+        min_pose_detection_confidence=0.5,
+        min_pose_landmarks_confidence=0.5,
+        min_hand_landmarks_confidence=0.5,
+        output_face_blendshapes=False,
     )
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    return holistic, mp_holistic, mp_drawing, mp_drawing_styles
+    
+    # 2. Hands
+    hands_base = mp_python.BaseOptions(model_asset_path=HANDS_MODEL_PATH)
+    hands_options = mp_vision.HandLandmarkerOptions(
+        base_options=hands_base,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    
+    return (mp_vision.HolisticLandmarker.create_from_options(holistic_options),
+            mp_vision.HandLandmarker.create_from_options(hands_options))
 
-def extract_holistic(results) -> np.ndarray:
+class HandTracker:
+    class _P:
+        __slots__ = ('x', 'y')
+        def __init__(self, x: float, y: float): self.x = x; self.y = y
+    def __init__(self, ema_alpha: float = 0.45, miss_ttl: int = 5, max_jump: float = 0.28):
+        self.alpha = ema_alpha
+        self.ttl = miss_ttl
+        self.max_jump = max_jump
+        self._ema_l = None
+        self._ema_r = None
+        self._miss_l = 0
+        self._miss_r = 0
+    def anchors(self):
+        P = self._P
+        return (P(*self._ema_l) if self._ema_l else None, P(*self._ema_r) if self._ema_r else None)
+    def is_plausible(self, x: float, y: float, slot: int) -> bool:
+        ema = self._ema_l if slot == LHAND_START else self._ema_r
+        if ema is None: return True
+        return ((x - ema[0])**2 + (y - ema[1])**2)**0.5 < self.max_jump
+    def update(self, frame_data: np.ndarray):
+        def _upd(ema, miss, slot):
+            w = frame_data[slot]
+            if not np.isnan(w[0]):
+                wx, wy = float(w[0]), float(w[1])
+                if ema is None: return (wx, wy), 0
+                return (self.alpha*wx + (1-self.alpha)*ema[0], self.alpha*wy + (1-self.alpha)*ema[1]), 0
+            miss += 1
+            return (None if miss >= self.ttl else ema), miss
+        self._ema_l, self._miss_l = _upd(self._ema_l, self._miss_l, LHAND_START)
+        self._ema_r, self._miss_r = _upd(self._ema_r, self._miss_r, RHAND_START)
+    def reset(self):
+        self._ema_l = self._ema_r = None
+        self._miss_l = self._miss_r = 0
+
+def extract_hybrid(res_holistic, res_hands, tracker=None) -> np.ndarray:
     frame_data = np.full((543, 3), np.nan, dtype=np.float32)
-    if results.face_landmarks:
-        for i, lm in enumerate(results.face_landmarks.landmark):
-            if i < 468: 
-                frame_data[i] = [lm.x, lm.y, lm.z]
-    if results.left_hand_landmarks:
-        for i, lm in enumerate(results.left_hand_landmarks.landmark):
-            frame_data[468 + i] = [lm.x, lm.y, lm.z]
-    if results.pose_landmarks:
-        for i, lm in enumerate(results.pose_landmarks.landmark):
-            frame_data[489 + i] = [lm.x, lm.y, lm.z]
-    if results.right_hand_landmarks:
-        for i, lm in enumerate(results.right_hand_landmarks.landmark):
-            frame_data[522 + i] = [lm.x, lm.y, lm.z]
+    if res_holistic.face_landmarks:
+        for i, lm in enumerate(res_holistic.face_landmarks):
+            if i < 468: frame_data[FACE_START + i] = [lm.x, lm.y, lm.z]
+    if res_holistic.pose_landmarks:
+        for i, lm in enumerate(res_holistic.pose_landmarks):
+            if i < 33: frame_data[POSE_START + i] = [lm.x, lm.y, lm.z]
+    anchor_l = res_holistic.left_hand_landmarks[0] if res_holistic.left_hand_landmarks else None
+    anchor_r = res_holistic.right_hand_landmarks[0] if res_holistic.right_hand_landmarks else None
+    if tracker is not None:
+        t_anc_l, t_anc_r = tracker.anchors()
+        if anchor_l is None: anchor_l = t_anc_l
+        if anchor_r is None: anchor_r = t_anc_r
+    if anchor_l is None and res_holistic.pose_landmarks:
+        anchor_l = res_holistic.pose_landmarks[15]
+    if anchor_r is None and res_holistic.pose_landmarks:
+        anchor_r = res_holistic.pose_landmarks[16]
+    def _dist(a, b): return ((a.x - b.x)**2 + (a.y - b.y)**2) ** 0.5
+    def _slot_for_hand(wrist) -> int:
+        if anchor_l is not None and anchor_r is not None:
+            slot = LHAND_START if _dist(wrist, anchor_l) < _dist(wrist, anchor_r) else RHAND_START
+        elif anchor_l is not None:
+            slot = LHAND_START if _dist(wrist, anchor_l) < 0.15 else RHAND_START
+        elif anchor_r is not None:
+            slot = RHAND_START if _dist(wrist, anchor_r) < 0.15 else LHAND_START
+        else:
+            slot = LHAND_START if wrist.x >= 0.5 else RHAND_START
+        if tracker is not None and not tracker.is_plausible(wrist.x, wrist.y, slot):
+            other = RHAND_START if slot == LHAND_START else LHAND_START
+            if tracker.is_plausible(wrist.x, wrist.y, other): slot = other
+        return slot
+    def _is_duplicate_hand(wrist, threshold=0.1):
+        if not np.isnan(frame_data[LHAND_START, 0]):
+            l_wrist = frame_data[LHAND_START]
+            if ((wrist.x - l_wrist[0])**2 + (wrist.y - l_wrist[1])**2)**0.5 < threshold: return True
+        if not np.isnan(frame_data[RHAND_START, 0]):
+            r_wrist = frame_data[RHAND_START]
+            if ((wrist.x - r_wrist[0])**2 + (wrist.y - r_wrist[1])**2)**0.5 < threshold: return True
+        return False
+    if res_hands.hand_landmarks:
+        for hand_lms in res_hands.hand_landmarks:
+            wrist = hand_lms[0]
+            slot  = _slot_for_hand(wrist)
+            if np.isnan(frame_data[slot, 0]) and not _is_duplicate_hand(wrist):
+                for i, lm in enumerate(hand_lms):
+                    if i < 21: frame_data[slot + i] = [lm.x, lm.y, lm.z]
+    if res_holistic.left_hand_landmarks and np.isnan(frame_data[LHAND_START, 0]):
+        if not _is_duplicate_hand(res_holistic.left_hand_landmarks[0]):
+            for i, lm in enumerate(res_holistic.left_hand_landmarks):
+                if i < 21: frame_data[LHAND_START + i] = [lm.x, lm.y, lm.z]
+    if res_holistic.right_hand_landmarks and np.isnan(frame_data[RHAND_START, 0]):
+        if not _is_duplicate_hand(res_holistic.right_hand_landmarks[0]):
+            for i, lm in enumerate(res_holistic.right_hand_landmarks):
+                if i < 21: frame_data[RHAND_START + i] = [lm.x, lm.y, lm.z]
     return frame_data
+
+def draw_landmarks_cv2(frame: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    h, w, _ = frame.shape
+    HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (5, 6), (6, 7), (7, 8),
+        (9, 10), (10, 11), (11, 12),
+        (13, 14), (14, 15), (15, 16),
+        (17, 18), (18, 19), (19, 20),
+        (0, 5), (5, 9), (9, 13), (13, 17), (0, 17)
+    ]
+    def _draw_hand(start_idx, dot_color, line_color, radius=4, thickness=2):
+        pts = []
+        for i in range(21):
+            lm = vec[start_idx + i]
+            if np.isnan(lm[0]): pts.append(None)
+            else: pts.append((int(lm[0] * w), int(lm[1] * h)))
+        if all(p is None for p in pts): return
+        for p1, p2 in HAND_CONNECTIONS:
+            if pts[p1] is not None and pts[p2] is not None:
+                cv2.line(frame, pts[p1], pts[p2], line_color, thickness)
+        for p in pts:
+            if p is not None:
+                cv2.circle(frame, p, radius, dot_color, -1)
+    _draw_hand(LHAND_START, (0, 255, 0), (144, 238, 144))
+    _draw_hand(RHAND_START, (0, 0, 255), (128, 128, 255))
+    return frame
 
 
 # ─── PREPROCESS LAYER ─────────────────────────────────────────────────────────
@@ -236,7 +386,7 @@ def load_tflite_model(model_path: str = ""):
 # ─── FRAME BUFFER & PREDICTOR ─────────────────────────────────────────────────
 class SignPredictorTFLite:
     def __init__(self, interpreter, input_details, output_details, 
-                 label_map: dict, label_original: dict, topk: int = 3, slide: int = 15):
+                 label_map: dict, label_original: dict, topk: int = 3, slide: int = 30):
         self.interpreter    = interpreter
         self.input_details  = input_details
         self.output_details = output_details
@@ -248,23 +398,40 @@ class SignPredictorTFLite:
         self.preprocess = Preprocess(max_len=MAX_LEN)
         self.buffer     = []
 
-        self.last_label      = ""
-        self.last_original   = ""
-        self.last_confidence = 0.0
-        self.last_topk       = []
-        self.is_detecting    = False
-        self.hand_detected   = False
+        self.last_label          = ""
+        self.last_original       = ""
+        self.last_confidence     = 0.0
+        self.last_topk           = []
+        self.is_detecting        = False
+        self.hand_detected       = False
+        self._grace_count        = 0
+        self._recent_labels      = []
+        self._last_known_vec     = None
+
+    GRACE_MAX   = 8
+    CLEAR_AFTER = 20
 
     def push_frame(self, vec_543: np.ndarray) -> bool:
-        lhand = vec_543[468:489]
-        rhand = vec_543[522:543]
+        lhand = vec_543[LHAND_START:LHAND_END]
+        rhand = vec_543[RHAND_START:RHAND_END]
         has_hand = not (np.isnan(lhand).all() and np.isnan(rhand).all())
-        
+
         self.hand_detected = has_hand
 
         if has_hand:
-            self.is_detecting = True
+            self.is_detecting    = True
+            self._grace_count    = 0
+            self._last_known_vec = vec_543.copy()
             self.buffer.append(vec_543)
+        elif self._grace_count < self.GRACE_MAX and self._last_known_vec is not None:
+            self._grace_count += 1
+            self.buffer.append(self._last_known_vec)
+        else:
+            self._grace_count += 1
+            if self._grace_count >= self.CLEAR_AFTER:
+                self.buffer          = []
+                self.is_detecting    = False
+                self._last_known_vec = None
 
         if len(self.buffer) >= BUFFER_LEN:
             self._predict()
@@ -298,7 +465,6 @@ class SignPredictorTFLite:
 
         probs = tf.nn.softmax(logits[0]).numpy()
 
-
         # Top-K
         top_idx = np.argsort(probs)[::-1][:self.topk]
         self.last_topk = [
@@ -308,10 +474,21 @@ class SignPredictorTFLite:
             for i in top_idx
         ]
 
-        best_idx              = top_idx[0]
-        self.last_label       = self.label_map.get(best_idx, f"class_{best_idx}")
-        self.last_original    = self.label_original.get(best_idx, self.last_label)
-        self.last_confidence  = float(probs[best_idx])
+        best_idx  = top_idx[0]
+        raw_label = self.label_map.get(best_idx, f"class_{best_idx}")
+        raw_conf  = float(probs[best_idx])
+
+        # Smoothing: majority vote
+        self._recent_labels.append(raw_label)
+        if len(self._recent_labels) > 3:
+            self._recent_labels.pop(0)
+
+        from collections import Counter
+        vote = Counter(self._recent_labels).most_common(1)[0]
+        if vote[1] >= 2:
+            self.last_label      = raw_label
+            self.last_original   = self.label_original.get(best_idx, raw_label)
+            self.last_confidence = raw_conf
 
     def reset(self):
         self.buffer          = []
@@ -320,6 +497,9 @@ class SignPredictorTFLite:
         self.last_confidence = 0.0
         self.last_topk       = []
         self.is_detecting    = False
+        self._grace_count    = 0
+        self._recent_labels  = []
+        self._last_known_vec = None
 
 
 # ─── DRAW OVERLAY ─────────────────────────────────────────────────────────────
@@ -358,16 +538,15 @@ def draw_overlay(frame: np.ndarray, predictor: SignPredictorTFLite,
     return frame
 
 
-# ─── MAIN CAMERA LOOP ─────────────────────────────────────────────────────────
 def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
-    label_map, label_original = load_label_map()
+    from concurrent.futures import ThreadPoolExecutor
     
-    # Sử dụng load_tflite_model thay vì load_model
+    label_map, label_original = load_label_map()
     interpreter, input_details, output_details = load_tflite_model(model_path)
-    holistic, mp_holistic, mp_drawing, mp_drawing_styles = init_mediapipe()
+    holistic_model, hand_model = init_mediapipe()
     
     predictor = SignPredictorTFLite(
-        interpreter, input_details, output_details, 
+        interpreter, input_details, output_details,
         label_map, label_original, topk=topk
     )
 
@@ -376,19 +555,21 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
         print(f"[ERROR] Không mở được camera {camera_idx}")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    cv2.namedWindow("SignBridge AI (TFLite Engine)", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("SignBridge AI (TFLite Engine)", 800, 600)
+    cv2.namedWindow("SignBridge AI (TFLite)", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("SignBridge AI (TFLite)", 640, 480)
 
-    print("\n[INFO] Camera đang chạy (Phiên bản TFLite siêu nén).")
+    print("\n[INFO] Camera đang chạy (Phiên bản TFLite + Hybrid Tracker).")
     os.makedirs("captures", exist_ok=True)
     frame_count = 0
     fps_time    = time.time()
     fps         = 0.0
+    t_start_ns  = time.perf_counter_ns()
 
-    with holistic:
+    tracker = HandTracker()
+    with ThreadPoolExecutor(max_workers=2) as mp_executor:
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -399,33 +580,38 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
                 fps = 30 / (time.time() - fps_time)
                 fps_time = time.time()
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = holistic.process(rgb)
-            rgb.flags.writeable = True
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            
+            current_ms = (time.perf_counter_ns() - t_start_ns) // 1_000_000
+            
+            future_holistic = mp_executor.submit(holistic_model.detect_for_video, mp_image, current_ms)
+            future_hands    = mp_executor.submit(hand_model.detect_for_video,    mp_image, current_ms)
 
-            vec = extract_holistic(results)
+            res_holistic = future_holistic.result()
+            res_hands    = future_hands.result()
+
+            vec = extract_hybrid(res_holistic, res_hands, tracker)
+            tracker.update(vec)
             predictor.push_frame(vec)
 
-            # Chỉ vẽ tay
-
-            if results.left_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style())
-            if results.right_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style())
+            draw_landmarks_cv2(frame, vec)
 
             frame = cv2.flip(frame, 1)
 
             frame = draw_overlay(frame, predictor, len(predictor.buffer), topk)
-            cv2.putText(frame, f"FPS: {fps:.0f}", (frame.shape[1] - 90, 25),
+            cv2.putText(frame, f"FPS: {fps:.0f} (TFLITE HYBRID)", (frame.shape[1] - 180, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            cv2.imshow("SignBridge AI (TFLite Engine)", frame)
+            l_ok = not np.isnan(vec[LHAND_START, 0])
+            r_ok = not np.isnan(vec[RHAND_START, 0])
+            hand_status = f"L:{'OK' if l_ok else '--'}  R:{'OK' if r_ok else '--'}  buf:{len(predictor.buffer):02d}/{BUFFER_LEN}"
+            cv2.putText(frame, hand_status, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
-            # Hỗ trợ bấm nút X trên cửa sổ để tắt
-            if cv2.getWindowProperty("SignBridge AI (TFLite Engine)", cv2.WND_PROP_VISIBLE) < 1:
+            cv2.imshow("SignBridge AI (TFLite)", frame)
+
+            if cv2.getWindowProperty("SignBridge AI (TFLite)", cv2.WND_PROP_VISIBLE) < 1:
                 break
 
             key = cv2.waitKey(1) & 0xFF
@@ -433,11 +619,14 @@ def run_camera(model_path: str = "", camera_idx: int = 0, topk: int = 3):
                 break
             elif key == ord('r'):
                 predictor.reset()
+                tracker.reset()
             elif key == ord('s'):
                 fname = f"captures/capture_{int(time.time())}.png"
                 cv2.imwrite(fname, frame)
 
     cap.release()
+    holistic_model.close()
+    hand_model.close()
     cv2.destroyAllWindows()
 
 

@@ -103,8 +103,6 @@ ipython_config.py
 # PROJECT SPECIFIC IGNORES (SignBridge)
 # ---------------------------------------------------------
 
-# Downloaded MediaPipe Models
-holistic_landmarker.task
 
 # Raw Datasets (Videos, large csv files)
 dataset/

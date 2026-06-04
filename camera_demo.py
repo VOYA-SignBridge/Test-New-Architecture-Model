@@ -16,12 +16,12 @@ CÁCH CHẠY:
 """
 
 import os
-import csv
 import sys
 import time
 import argparse
 import glob
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 # ─── KIỂM TRA THƯ VIỆN ────────────────────────────────────────────────────────
 try:
@@ -75,15 +75,26 @@ CHANNELS        = 6 * NUM_NODES   # 708
 DEFAULT_MODEL_DIR   = "./output"
 DEFAULT_DATASET_DIR = "./dataset/Vietnamese"
 
-MP_MODEL_PATH = "holistic_landmarker.task"
-MP_MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
+HOLISTIC_MODEL_PATH = "holistic_landmarker.task"
+HOLISTIC_URL = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task"
+
+HANDS_MODEL_PATH = "hand_landmarker.task"
+HANDS_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+
+FACE_START,  FACE_END   = 0,   468
+LHAND_START, LHAND_END  = 468, 489
+POSE_START,  POSE_END   = 489, 522
+RHAND_START, RHAND_END  = 522, 543
 
 def _ensure_mp_model():
     """Tải model MediaPipe nếu chưa có."""
-    if not os.path.exists(MP_MODEL_PATH):
-        print(f"[INFO] Đang tải model MediaPipe ({MP_MODEL_PATH})...")
-        urllib.request.urlretrieve(MP_MODEL_URL, MP_MODEL_PATH)
-        print("[INFO] Tải xong!")
+    if not os.path.exists(HOLISTIC_MODEL_PATH):
+        print(f"[INFO] Đang tải model Holistic ({HOLISTIC_MODEL_PATH})...")
+        urllib.request.urlretrieve(HOLISTIC_URL, HOLISTIC_MODEL_PATH)
+    if not os.path.exists(HANDS_MODEL_PATH):
+        print(f"[INFO] Đang tải model Hand ({HANDS_MODEL_PATH})...")
+        urllib.request.urlretrieve(HANDS_URL, HANDS_MODEL_PATH)
+    print("[INFO] Đã tải đủ các mô hình MediaPipe!")
 
 
 # ─── LOAD LABEL MAP ───────────────────────────────────────────────────────────
@@ -116,54 +127,223 @@ def load_label_map(dataset_dir: str = DEFAULT_DATASET_DIR):
 
 # ─── MEDIAPIPE SETUP (Tasks API 0.10+) ────────────────────────────────────────
 def init_mediapipe():
-    """Khởi tạo HolisticLandmarker dùng MediaPipe Tasks API mới (>=0.10)."""
+    """Khởi tạo HolisticLandmarker và HandLandmarker dùng MediaPipe Tasks API."""
     _ensure_mp_model()
-    base_options = mp_python.BaseOptions(model_asset_path=MP_MODEL_PATH)
-    options = mp_vision.HolisticLandmarkerOptions(
-        base_options=base_options,
+    
+    # 1. Holistic
+    holistic_base = mp_python.BaseOptions(model_asset_path=HOLISTIC_MODEL_PATH)
+    holistic_options = mp_vision.HolisticLandmarkerOptions(
+        base_options=holistic_base,
         running_mode=mp_vision.RunningMode.VIDEO,
         min_face_detection_confidence=0.5,
         min_face_landmarks_confidence=0.5,
         min_pose_detection_confidence=0.5,
         min_pose_landmarks_confidence=0.5,
-        min_hand_landmarks_confidence=0.5,  # 0.5 giúp detect tốt hơn khi tay co lại
+        min_hand_landmarks_confidence=0.5,
         output_face_blendshapes=False,
     )
-    return mp_vision.HolisticLandmarker.create_from_options(options)
+    
+    # 2. Hands
+    hands_base = mp_python.BaseOptions(model_asset_path=HANDS_MODEL_PATH)
+    hands_options = mp_vision.HandLandmarkerOptions(
+        base_options=hands_base,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    
+    return (mp_vision.HolisticLandmarker.create_from_options(holistic_options),
+            mp_vision.HandLandmarker.create_from_options(hands_options))
 
 
-def extract_holistic(results) -> np.ndarray:
+# ─── EMA TEMPORAL HAND TRACKER ───────────────────────────────────────────────
+class HandTracker:
     """
-    Trích xuất vector (543, 3) từ kết quả Tasks API.
-    Cấu trúc y hệt mảng 543 điểm chuẩn:
-      0-467: Face  |  468-488: Left Hand  |  489-521: Pose  |  522-542: Right Hand
-    Tasks API trả về list NormalizedLandmark trực tiếp (không có .landmark).
+    Exponential Moving Average tracker cho tay Trái và Phải.
+    Thay vì chỉ nhớ 1 frame trước, HandTracker duy trì vị trí EMA
+    (mượt hơn, kháng nhiễu hơn) và tự xoá khi tay biến mất > miss_ttl frame.
+
+    Ngoài ra cung cấp is_plausible() để phát hiện detection nhảy bên đột ngột.
+    """
+    class _P:
+        """Lightweight point object tương thích với MediaPipe landmark."""
+        __slots__ = ('x', 'y')
+        def __init__(self, x: float, y: float): self.x = x; self.y = y
+
+    def __init__(self, ema_alpha: float = 0.45, miss_ttl: int = 5,
+                 max_jump: float = 0.28):
+        """
+        ema_alpha : hệ số EMA ∈ (0,1). Lớn=cập nhật nhanh, Nhỏ=mượt hơn.
+        miss_ttl  : frame không thấy tay liên tiếp trước khi xoá EMA.
+        max_jump  : khoảng cách (normalized) tối đa 1 tay di chuyển/frame.
+                    Vượt quá → detection bị nghi sai bên, thử gán ngược.
+        """
+        self.alpha    = ema_alpha
+        self.ttl      = miss_ttl
+        self.max_jump = max_jump
+        self._ema_l   = None   # (x, y) EMA tay Trái
+        self._ema_r   = None   # (x, y) EMA tay Phải
+        self._miss_l  = 0
+        self._miss_r  = 0
+
+    def anchors(self):
+        """Trả về (anchor_l, anchor_r) — dùng làm điểm neo trong extract_hybrid."""
+        P = self._P
+        return (
+            P(*self._ema_l) if self._ema_l else None,
+            P(*self._ema_r) if self._ema_r else None,
+        )
+
+    def is_plausible(self, x: float, y: float, slot: int) -> bool:
+        """Kiểm tra detection có hợp lý không so với EMA (không nhảy xa quá)."""
+        ema = self._ema_l if slot == LHAND_START else self._ema_r
+        if ema is None:
+            return True  # chưa có lịch sử → luôn chấp nhận
+        return ((x - ema[0])**2 + (y - ema[1])**2)**0.5 < self.max_jump
+
+    def update(self, frame_data: np.ndarray):
+        """Cập nhật EMA từ kết quả extract_hybrid(). Gọi sau mỗi frame."""
+        def _upd(ema, miss, slot):
+            w = frame_data[slot]
+            if not np.isnan(w[0]):
+                wx, wy = float(w[0]), float(w[1])
+                if ema is None:
+                    return (wx, wy), 0
+                return (self.alpha*wx + (1-self.alpha)*ema[0],
+                        self.alpha*wy + (1-self.alpha)*ema[1]), 0
+            miss += 1
+            return (None if miss >= self.ttl else ema), miss
+        self._ema_l, self._miss_l = _upd(self._ema_l, self._miss_l, LHAND_START)
+        self._ema_r, self._miss_r = _upd(self._ema_r, self._miss_r, RHAND_START)
+
+    def reset(self):
+        self._ema_l = self._ema_r = None
+        self._miss_l = self._miss_r = 0
+
+
+def extract_hybrid(res_holistic, res_hands, tracker=None) -> np.ndarray:
+    """
+    Trích xuất Hybrid vector (543, 3) từ Holistic và HandLandmarker.
+    Cấu trúc: [0:468] Face | [468:489] LHand (user) | [489:522] Pose | [522:543] RHand (user)
+
+    CHIẾN LƯỢC PHÂN LOẠI TAY — Holistic-Anchor Assignment:
+    ─────────────────────────────────────────────────────────────────
+    Holistic đã tự xử lý mirror nội bộ và cung cấp 2 anchor TIN CẬY:
+      • left_hand_landmarks  → Cổ tay TRÁI người dùng  (chuẩn, đã flip)
+      • right_hand_landmarks → Cổ tay PHẢI người dùng (chuẩn, đã flip)
+
+    Quy trình:
+      1. Holistic cung cấp 1–2 cổ tay anchor (trái/phải).
+      2. Với MỖI bàn tay từ HandLandmarker:
+           - Tính khoảng cách cổ tay (landmark 0) tới anchor Trái và anchor Phải.
+           - Gán vào slot (LHAND / RHAND) tương ứng với anchor GẦN hơn.
+           - Nếu Holistic không thấy tay nào làm anchor (mất toàn bộ): fallback sang Pose Wrist.
+           - Nếu mất luôn Pose: fallback sang x-position (x>=0.5 ảnh gốc = Trái user).
+      3. Slot đã có dữ liệu không bị ghi đè (first-win — HandLandmarker ưu tiên).
+      4. Sau khi HandLandmarker chạy xong, dùng Holistic left/right_hand_landmarks để
+         lấp đầy slot còn NaN (chỉ khi anchor đó không trùng với slot đã có).
     """
     frame_data = np.full((543, 3), np.nan, dtype=np.float32)
 
-    if results.face_landmarks:
-        for i, lm in enumerate(results.face_landmarks):
+    # ── 1. MẶT & TƯ THẾ (từ Holistic, luôn đáng tin) ─────────────────────────
+    if res_holistic.face_landmarks:
+        for i, lm in enumerate(res_holistic.face_landmarks):
             if i < 468:
-                frame_data[i] = [lm.x, lm.y, lm.z]
+                frame_data[FACE_START + i] = [lm.x, lm.y, lm.z]
 
-    if results.left_hand_landmarks:
-        for i, lm in enumerate(results.left_hand_landmarks):
-            frame_data[468 + i] = [lm.x, lm.y, lm.z]
+    if res_holistic.pose_landmarks:
+        for i, lm in enumerate(res_holistic.pose_landmarks):
+            if i < 33:
+                frame_data[POSE_START + i] = [lm.x, lm.y, lm.z]
 
-    if results.pose_landmarks:
-        for i, lm in enumerate(results.pose_landmarks):
-            frame_data[489 + i] = [lm.x, lm.y, lm.z]
+    # ── 2. BÀN TAY ─────────────────────────────────────────────────────────────
+    # Nguồn anchor ưu tiên cao nhất: Holistic left/right_hand_landmarks
+    anchor_l = res_holistic.left_hand_landmarks[0]  if res_holistic.left_hand_landmarks  else None
+    anchor_r = res_holistic.right_hand_landmarks[0] if res_holistic.right_hand_landmarks else None
 
-    if results.right_hand_landmarks:
-        for i, lm in enumerate(results.right_hand_landmarks):
-            frame_data[522 + i] = [lm.x, lm.y, lm.z]
+    # Fallback 1: EMA Temporal Tracking (ổn định hơn single-frame lookback)
+    if tracker is not None:
+        t_anc_l, t_anc_r = tracker.anchors()
+        if anchor_l is None: anchor_l = t_anc_l
+        if anchor_r is None: anchor_r = t_anc_r
+
+    # Fallback 2: Pose Wrist
+    if anchor_l is None and res_holistic.pose_landmarks:
+        anchor_l = res_holistic.pose_landmarks[15]
+    if anchor_r is None and res_holistic.pose_landmarks:
+        anchor_r = res_holistic.pose_landmarks[16]
+
+    def _dist(a, b):
+        return ((a.x - b.x)**2 + (a.y - b.y)**2) ** 0.5
+
+    def _slot_for_hand(wrist) -> int:
+        """Gán slot dựa trên anchor gần nhất, có kiểm tra plausibility từ EMA."""
+        if anchor_l is not None and anchor_r is not None:
+            slot = LHAND_START if _dist(wrist, anchor_l) < _dist(wrist, anchor_r) else RHAND_START
+        elif anchor_l is not None:
+            slot = LHAND_START if _dist(wrist, anchor_l) < 0.15 else RHAND_START
+        elif anchor_r is not None:
+            slot = RHAND_START if _dist(wrist, anchor_r) < 0.15 else LHAND_START
+        else:
+            slot = LHAND_START if wrist.x >= 0.5 else RHAND_START
+
+        # Plausibility check: nếu detection nhảy xa hơn max_jump so với EMA,
+        # thử gán sang slot ngược lại — có thể EMA bên kia hợp lý hơn.
+        if tracker is not None and not tracker.is_plausible(wrist.x, wrist.y, slot):
+            other = RHAND_START if slot == LHAND_START else LHAND_START
+            if tracker.is_plausible(wrist.x, wrist.y, other):
+                slot = other
+        return slot
+
+    def _is_duplicate_hand(wrist, threshold=0.1):
+        """Kiểm tra xem tay này đã được ghi vào slot nào chưa (chống 1 tay thành 2 tay)"""
+        # Kiểm tra slot Trái
+        if not np.isnan(frame_data[LHAND_START, 0]):
+            l_wrist = frame_data[LHAND_START]
+            if ((wrist.x - l_wrist[0])**2 + (wrist.y - l_wrist[1])**2)**0.5 < threshold:
+                return True
+        # Kiểm tra slot Phải
+        if not np.isnan(frame_data[RHAND_START, 0]):
+            r_wrist = frame_data[RHAND_START]
+            if ((wrist.x - r_wrist[0])**2 + (wrist.y - r_wrist[1])**2)**0.5 < threshold:
+                return True
+        return False
+
+    # ── 2a. Nguồn CHÍNH: HandLandmarker ───────────────────────────────────────
+    if res_hands.hand_landmarks:
+        for hand_lms in res_hands.hand_landmarks:
+            wrist = hand_lms[0]
+            slot  = _slot_for_hand(wrist)
+            # First-win: không ghi đè slot đã có và kiểm tra chống trùng
+            if np.isnan(frame_data[slot, 0]) and not _is_duplicate_hand(wrist):
+                for i, lm in enumerate(hand_lms):
+                    if i < 21:
+                        frame_data[slot + i] = [lm.x, lm.y, lm.z]
+
+    # ── 2b. Nguồn FALLBACK: Holistic left/right_hand_landmarks ────────────────
+    # Holistic đã xác nhận đúng trái/phải; chỉ dùng nếu slot còn NaN.
+    if res_holistic.left_hand_landmarks and np.isnan(frame_data[LHAND_START, 0]):
+        if not _is_duplicate_hand(res_holistic.left_hand_landmarks[0]):
+            for i, lm in enumerate(res_holistic.left_hand_landmarks):
+                if i < 21:
+                    frame_data[LHAND_START + i] = [lm.x, lm.y, lm.z]
+
+    if res_holistic.right_hand_landmarks and np.isnan(frame_data[RHAND_START, 0]):
+        if not _is_duplicate_hand(res_holistic.right_hand_landmarks[0]):
+            for i, lm in enumerate(res_holistic.right_hand_landmarks):
+                if i < 21:
+                    frame_data[RHAND_START + i] = [lm.x, lm.y, lm.z]
 
     return frame_data
 
 
-def draw_landmarks_cv2(frame: np.ndarray, results) -> np.ndarray:
+
+
+def draw_landmarks_cv2(frame: np.ndarray, vec: np.ndarray) -> np.ndarray:
     """
-    Vẽ landmarks bằng OpenCV thuần (Tasks API không có mp_drawing).
+    Vẽ landmarks bằng OpenCV thuần từ array vec_543 (ảnh gốc chưa bị mirror)
     """
     h, w, _ = frame.shape
     
@@ -176,25 +356,32 @@ def draw_landmarks_cv2(frame: np.ndarray, results) -> np.ndarray:
         (0, 5), (5, 9), (9, 13), (13, 17), (0, 17)
     ]
 
-    def _draw_hand(landmarks, dot_color, line_color, radius=4, thickness=2):
-        if not landmarks: return
-        
+    def _draw_hand(start_idx, dot_color, line_color, radius=4, thickness=2):
+        # Lấy 21 điểm của tay; None nếu điểm đó là NaN
         pts = []
-        for lm in landmarks:
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            pts.append((cx, cy))
+        for i in range(21):
+            lm = vec[start_idx + i]
+            if np.isnan(lm[0]):
+                pts.append(None)
+            else:
+                pts.append((int(lm[0] * w), int(lm[1] * h)))
+
+        # Nếu toàn bộ tay là NaN thì bỏ qua
+        if all(p is None for p in pts):
+            return
             
-        # Vẽ các đoạn thẳng (xương)
+        # Vẽ các đoạn thẳng (xương) — bỏ qua nếu một trong 2 đầu là NaN
         for p1, p2 in HAND_CONNECTIONS:
-            if p1 < len(pts) and p2 < len(pts):
+            if pts[p1] is not None and pts[p2] is not None:
                 cv2.line(frame, pts[p1], pts[p2], line_color, thickness)
                 
-        # Vẽ các chấm (khớp)
+        # Vẽ các chấm (khớp) — bỏ qua điểm NaN
         for p in pts:
-            cv2.circle(frame, p, radius, dot_color, -1)
+            if p is not None:
+                cv2.circle(frame, p, radius, dot_color, -1)
 
-    _draw_hand(results.left_hand_landmarks,  (0, 255, 0), (144, 238, 144))  # tay trái — xanh lá
-    _draw_hand(results.right_hand_landmarks, (0, 0, 255), (128, 128, 255))  # tay phải — đỏ
+    _draw_hand(LHAND_START, (0, 255, 0), (144, 238, 144))  # tay trái người dùng — xanh lá
+    _draw_hand(RHAND_START, (0, 0, 255), (128, 128, 255))  # tay phải người dùng — đỏ
     
     return frame
 
@@ -343,10 +530,10 @@ class SignPredictor:
         self.label_map      = label_map
         self.label_original = label_original
         self.topk           = topk
-        self.slide          = slide  # slide = 30: predict mỗi 30 frame, đủ để tín hiệu ổn định
+        self.slide          = slide
 
         self.preprocess = Preprocess(max_len=MAX_LEN)
-        self.buffer     = []  # list of ndarray (543, 3)
+        self.buffer     = []
 
         self.last_label         = ""
         self.last_original      = ""
@@ -354,16 +541,16 @@ class SignPredictor:
         self.last_topk          = []
         self.is_detecting       = False
         self.hand_detected      = False
-        self._grace_count       = 0   # đếm số frame liên tiếp không có tay
-        self._recent_labels     = []  # lưu 3 kết quả gần nhất để smoothing
-        self._last_known_vec    = None  # vị trí tay lần cuối detect được
+        self._grace_count       = 0
+        self._recent_labels     = []
+        self._last_known_vec    = None
 
-    GRACE_MAX   = 8   # số frame tay tạm khuất vẫn giữ buffer (tăng từ 5 lên 8)
-    CLEAR_AFTER = 20  # số frame sau khi tay biến hẳn mới xóa buffer
+    GRACE_MAX   = 8
+    CLEAR_AFTER = 20
 
     def push_frame(self, vec_543: np.ndarray) -> bool:
-        lhand = vec_543[468:489]
-        rhand = vec_543[522:543]
+        lhand = vec_543[LHAND_START:LHAND_END]
+        rhand = vec_543[RHAND_START:RHAND_END]
         has_hand = not (np.isnan(lhand).all() and np.isnan(rhand).all())
 
         self.hand_detected = has_hand
@@ -371,19 +558,12 @@ class SignPredictor:
         if has_hand:
             self.is_detecting    = True
             self._grace_count    = 0
-            self._last_known_vec = vec_543.copy()  # lưu vị trí mới nhất
+            self._last_known_vec = vec_543.copy()
             self.buffer.append(vec_543)
         elif self._grace_count < self.GRACE_MAX and self._last_known_vec is not None:
-            # ── "LAST KNOWN POSITION" TRACKING ──────────────────────────
-            # Tay tạm khuất (nằm ngang, co lại, bị che khuất...) nhưng
-            # ta vẫn biết tay đang ở đâu (lần cuối detect được).
-            # Điền vị trí cũ vào buffer thay vì NaN để:
-            #   1) buffer không bị đứt → signal liên tục
-            #   2) model không nhận toàn NaN → predict ít nhiễu hơn
             self._grace_count += 1
             self.buffer.append(self._last_known_vec)
         else:
-            # Tay mất hẳn quá lâu
             self._grace_count += 1
             if self._grace_count >= self.CLEAR_AFTER:
                 self.buffer          = []
@@ -425,28 +605,28 @@ class SignPredictor:
         raw_label = self.label_map.get(best_idx, f"class_{best_idx}")
         raw_conf  = float(probs[best_idx])
 
-        # Smoothing: chỉ cập nhật kết quả nếu cùng tên 2/3 lần gần nhất
+        # Smoothing: majority vote trong 3 kết quả gần nhất
         self._recent_labels.append(raw_label)
         if len(self._recent_labels) > 3:
             self._recent_labels.pop(0)
 
-        # Majority vote trong 3 kết quả gần nhất
         from collections import Counter
         vote = Counter(self._recent_labels).most_common(1)[0]
-        if vote[1] >= 2:  # ít nhất 2/3 lần cùng tên mới hiện
+        if vote[1] >= 2:
             self.last_label      = raw_label
             self.last_original   = self.label_original.get(best_idx, raw_label)
             self.last_confidence = raw_conf
 
     def reset(self):
-        self.buffer          = []
-        self.last_label      = ""
-        self.last_original   = ""
-        self.last_confidence = 0.0
-        self.last_topk       = []
-        self.is_detecting    = False
-        self._grace_count    = 0
-        self._recent_labels  = []
+        self.buffer             = []
+        self.last_label         = ""
+        self.last_original      = ""
+        self.last_confidence    = 0.0
+        self.last_topk          = []
+        self.is_detecting       = False
+        self._grace_count       = 0
+        self._recent_labels     = []
+        self._last_known_vec    = None  # ← phải reset kểo grace period bơm data cũ vào buffer mới
 
 
 # ─── DRAW OVERLAY ─────────────────────────────────────────────────────────────
@@ -496,84 +676,110 @@ def run_camera(model_path: str = "", camera_idx: int = 0,
                topk: int = 3, dataset_dir: str = DEFAULT_DATASET_DIR):
     label_map, label_original = load_label_map(dataset_dir)
     model = load_model(model_path)
-    landmarker = init_mediapipe()   # HolisticLandmarker (Tasks API)
+    holistic_model, hand_model = init_mediapipe()   # Khởi tạo 2 mô hình (Hybrid)
     predictor  = SignPredictor(model, label_map, label_original, topk=topk)
 
     cap = cv2.VideoCapture(camera_idx)
     if not cap.isOpened():
         print(f"[ERROR] Không mở được camera {camera_idx}")
-        landmarker.close()
+        holistic_model.close()
+        hand_model.close()
         return
 
-    # Đặt kích thước camera nhỏ lại
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+    # Đặt kích thước camera nhỏ lại để tăng FPS
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
     cv2.namedWindow("SignBridge AI", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("SignBridge AI", 800, 600)
+    cv2.resizeWindow("SignBridge AI", 640, 480)
 
-    print("\n[INFO] Camera đang chạy (Tasks API MediaPipe 0.10+).")
+    print("\n[INFO] Camera đang chạy chế độ HYBRID (Holistic + Hands).")
     os.makedirs("captures", exist_ok=True)
 
-    frame_count   = 0
-    fps_time      = time.time()
-    fps           = 0.0
-    current_ms    = 0          # timestamp tăng dần cho detect_for_video
-    cap_fps       = cap.get(cv2.CAP_PROP_FPS)
-    frame_ms      = int(1000 / cap_fps) if cap_fps > 0 else 33  # ~30fps
+    frame_idx    = 0
+    fps_time     = time.time()
+    fps          = 0.0
+    # Dùng perf_counter (ns) để tính timestamp thực tế — tránh trườt do FPS không chính xác
+    t_start_ns   = time.perf_counter_ns()
 
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Tạo thread pool 2 workers — mỗi worker đảm nhận 1 mô hình MediaPipe.
+        # MediaPipe inference là C++ extension nên nó TỰ ĐỘNG nhả GIL trong lúc chạy,
+        # cho phép 2 threads này thực sự chiếm 2 lõi CPU khác nhau cùng lúc.
+        # Tạo executor 1 lần bên ngoài vòng lặp để tránh overhead tạo/xoá thread mỗi frame.
+        tracker = HandTracker()   # EMA temporal tracker cho tay Trái/Phải
+        with ThreadPoolExecutor(max_workers=2) as mp_executor:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            frame_count += 1
-            if frame_count % 30 == 0:
-                fps      = 30 / (time.time() - fps_time)
-                fps_time = time.time()
+                frame_idx += 1
+                if frame_idx % 30 == 0:
+                    fps      = 30 / (time.time() - fps_time)
+                    fps_time = time.time()
 
-            # BƯỚC 1: XỬ LÝ KHUNG HÌNH GỐC (CHƯA LẬT)
-            # MediaPipe sẽ xử lý frame gốc để lấy toạ độ chuẩn không bị ngược trái/phải
-            # (khớp hoàn toàn với dữ liệu training).
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            results  = landmarker.detect_for_video(mp_image, current_ms)
-            current_ms += frame_ms
+                # BƯỚC 1: XỬ LÝ KHUNG HÌNH GỐC (CHƯA LẬT)
+                # MediaPipe sẽ xử lý frame gốc để lấy toạ độ chuẩn không bị ngược trái/phải
+                # (khớp hoàn toàn với dữ liệu training).
+                rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                
+                # Timestamp thực tế tính từ perf_counter — được đảm bảo tăng đều, không bị trôi
+                current_ms = (time.perf_counter_ns() - t_start_ns) // 1_000_000
+                
+                # Dispatch 2 mô hình sang 2 threads — chạy SONG SONG trên 2 CPU cores.
+                # mp_image là read-only nên an toàn để 2 threads cùng đọc đồng thời.
+                future_holistic = mp_executor.submit(holistic_model.detect_for_video, mp_image, current_ms)
+                future_hands    = mp_executor.submit(hand_model.detect_for_video,    mp_image, current_ms)
 
-            # Trích xuất 543 điểm chuẩn để đưa vào model
-            vec = extract_holistic(results)
-            predictor.push_frame(vec)
+                # Chờ cả 2 kết quả (thread nào xong trước thì chờ thread còn lại)
+                res_holistic = future_holistic.result()
+                res_hands    = future_hands.result()
 
-            # Vẽ skeleton lên frame CHƯA LẬT (để toạ độ vẽ khớp với ảnh gốc)
-            draw_landmarks_cv2(frame, results)
+                # Trích xuất 543 điểm chuẩn (Hybrid + EMA Temporal Tracking)
+                vec = extract_hybrid(res_holistic, res_hands, tracker)
+                tracker.update(vec)   # Cập nhật EMA ngay sau mỗi frame
+                predictor.push_frame(vec)
 
-            # BƯỚC 2: LẬT KHUNG HÌNH (MIRROR) ĐỂ HIỂN THỊ CHO NGƯỜI DÙNG DỄ NHÌN
-            frame = cv2.flip(frame, 1)
+                # Vẽ skeleton lên frame CHƯA LẬT (vẽ trực tiếp từ mảng vec)
+                draw_landmarks_cv2(frame, vec)
 
-            # BƯỚC 3: VẼ GIAO DIỆN CHỮ LÊN KHUNG HÌNH (lúc này chữ không bị lật ngược)
-            frame = draw_overlay(frame, predictor, len(predictor.buffer), topk)
-            cv2.putText(frame, f"FPS: {fps:.0f}", (frame.shape[1] - 90, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                # BƯỚC 2: LẬT KHUNG HÌNH (MIRROR) ĐỂ HIỂN THỊ CHO NGƯỜI DÙNG DỄ NHÌN
+                frame = cv2.flip(frame, 1)
 
-            cv2.imshow("SignBridge AI", frame)
+                # BƯỚC 3: VẼ GIAO DIỆN CHỮ LÊN KHUNG HÌNH (lúc này chữ không bị lật ngược)
+                frame = draw_overlay(frame, predictor, len(predictor.buffer), topk)
+                cv2.putText(frame, f"FPS: {fps:.0f} (HYBRID)", (frame.shape[1] - 150, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            # Hỗ trợ bấm nút X trên cửa sổ để tắt
-            if cv2.getWindowProperty("SignBridge AI", cv2.WND_PROP_VISIBLE) < 1:
-                break
+                # ── Status bar: tay L/R và buffer (góc trái trên, sau khi flip) ──
+                l_ok = not np.isnan(vec[LHAND_START, 0])
+                r_ok = not np.isnan(vec[RHAND_START, 0])
+                hand_status = f"L:{'OK' if l_ok else '--'}  R:{'OK' if r_ok else '--'}  buf:{len(predictor.buffer):02d}/{BUFFER_LEN}"
+                cv2.putText(frame, hand_status, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                break
-            elif key == ord('r'):
-                predictor.reset()
-            elif key == ord('s'):
-                fname = f"captures/capture_{int(time.time())}.png"
-                cv2.imwrite(fname, frame)
+                cv2.imshow("SignBridge AI", frame)
+
+                # Hỗ trợ bấm nút X trên cửa sổ để tắt
+                if cv2.getWindowProperty("SignBridge AI", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    break
+                elif key == ord('r'):
+                    predictor.reset()
+                elif key == ord('s'):
+                    fname = f"captures/capture_{int(time.time())}.png"
+                    cv2.imwrite(fname, frame)
     finally:
         cap.release()
-        landmarker.close()
+        holistic_model.close()
+        hand_model.close()
         cv2.destroyAllWindows()
+
 
 
 def main():

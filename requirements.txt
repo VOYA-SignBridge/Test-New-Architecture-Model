@@ -1,23 +1,30 @@
 # SignBridge - Vietnamese Sign Language Recognition Pipeline
 # ============================================================
-# Python 3.13.13 (exact version currently in use)
+# Python 3.10+ (Tested extensively on Python 3.12/3.13)
 #
-# Install all dependencies:
+# Cài đặt toàn bộ thư viện:
 #   pip install -r requirements.txt
 #
-# NOTE: GPU is NOT supported. This project runs on CPU (local) or TPU (Google Colab).
-#
-# IMPORTANT - Additional file required manually:
-#   holistic_landmarker.task (~13 MB)
-#   This file is downloaded automatically on first run of extract_mediapipe.py.
-#   If auto-download fails, download it manually from:
-#   https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
-#   and place it in the project root directory.
+# LƯU Ý VỀ MÔ HÌNH MEDIAPIPE (BẮT BUỘC):
+# Script `extract_mediapipe.py` sẽ tự động tải 2 file này vào thư mục gốc:
+#   1. holistic_landmarker.task (~13 MB)
+#   2. hand_landmarker.task (~3 MB)
+# 
+# Nếu bị lỗi mạng (auto-download fails), vui lòng tải thủ công 2 file trên tại:
+# - Holistic: https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
+# - Hands: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+# và đặt ngay trong thư mục gốc của dự án.
 # ============================================================
 
+# --- Core Libraries (Yêu cầu bắt buộc) ---
 tensorflow==2.21.0
 numpy==2.4.6
 opencv-python==4.13.0.92
 mediapipe==0.10.35
 tqdm==4.67.3
-torch==2.12.0
+
+# --- Optional Libraries (Tùy chọn cho Training Nâng cao) ---
+# Trong file `train.py` có hỗ trợ optimizer `RectifiedAdam` và `Lookahead` từ tensorflow-addons.
+# Nếu bạn muốn train mô hình đạt độ chính xác cao nhất như trên Kaggle, hãy bỏ comment dòng dưới đây.
+# (Lưu ý: tensorflow-addons đã ngừng phát triển, nếu lỗi cài đặt thì train.py sẽ tự fallback về Adam thường)
+# tensorflow-addons==0.23.0
